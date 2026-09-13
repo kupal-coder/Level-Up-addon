@@ -156,6 +156,81 @@ function facePuff(player) {
     } catch { /* ignore */ }
 }
 
+// ---- Physical SYSTEM: floating stat-lines anchored in front of the player ----
+// Invisible area_effect_clouds with glowing nametags. Nameplates billboard to
+// the camera, so they read as a real floating window. Fully cosmetic: if they
+// ever fail to render on some version, the form UI still carries the feature.
+const HOLO_TAG = "lu_holo";
+const HOLO_TICKS = 240; // 12s per summon
+const HOLO_GAP = 0.32; // vertical gap between lines
+
+function holoAnchor(player, slot) {
+    const dir = player.getViewDirection();
+    const head = player.getHeadLocation();
+    return {
+        x: head.x + dir.x * 2.4,
+        y: head.y + dir.y * 2.4 + 0.5 - slot * HOLO_GAP,
+        z: head.z + dir.z * 2.4,
+    };
+}
+
+function clearHologram(player) {
+    try {
+        for (const e of player.dimension.getEntities({ tags: [HOLO_TAG] })) {
+            try { if (e.getDynamicProperty("lu_owner") === player.id) e.remove(); } catch { /* ignore */ }
+        }
+    } catch { /* ignore */ }
+}
+
+function showHologram(player, lines, duration = HOLO_TICKS) {
+    try {
+        if (!player.isValid) return;
+        clearHologram(player);
+        const until = system.currentTick + duration;
+        lines.forEach((text, slot) => {
+            try {
+                const e = player.dimension.spawnEntity("minecraft:area_effect_cloud", holoAnchor(player, slot));
+                e.nameTag = text;
+                e.addTag(HOLO_TAG);
+                e.setDynamicProperty("lu_owner", player.id);
+                e.setDynamicProperty("lu_slot", slot);
+                e.setDynamicProperty("lu_until", until);
+            } catch { /* spawn failed */ }
+        });
+    } catch { /* ignore */ }
+}
+
+function statusHoloLines(s) {
+    return [
+        "§l§bS Y S T E M",
+        `§fLv ${s.level} §8• §e${s.points} stat points`,
+        `§cSTR ${s.str} §8• §aDUR ${s.dur} §8• §bAGI ${s.agi}`,
+        "§7defeat mobs to level up",
+    ];
+}
+
+// Keeper, every 5 ticks: expire old lines + keep active ones floating in front
+// of their owner's view. Scoped per online player, so no dimension-id guessing.
+system.runInterval(() => {
+    try {
+        const now = system.currentTick;
+        for (const owner of world.getPlayers()) {
+            try {
+                if (!owner.isValid) continue;
+                let list = [];
+                try { list = owner.dimension.getEntities({ tags: [HOLO_TAG] }); } catch { continue; }
+                for (const e of list) {
+                    try {
+                        if (e.getDynamicProperty("lu_owner") !== owner.id) continue;
+                        if (now > (e.getDynamicProperty("lu_until") ?? 0)) { e.remove(); continue; }
+                        e.teleport(holoAnchor(owner, e.getDynamicProperty("lu_slot") ?? 0));
+                    } catch { try { e.remove(); } catch { /* gone */ } }
+                }
+            } catch { /* skip this player */ }
+        }
+    } catch { /* ignore */ }
+}, 5);
+
 // ---- LEVEL UP cinematic (~2.5s): shake + fade + spiral + ARISE + title ----
 function levelUpCinematic(player, level, pointsGained) {
     safeCommand(player, `camerashake add @s 0.35 1.2 rotational`);
@@ -163,6 +238,7 @@ function levelUpCinematic(player, level, pointsGained) {
     safeSound(player, "mob.enderdragon.growl", { pitch: 0.5, volume: 0.8 });
     ringBurst(player, 10 + pointsGained * 2);
     spiralUp(player, 20 + pointsGained * 4);
+    try { showHologram(player, ["§l§eLEVEL UP", `§fLevel ${level}`, `§e+${pointsGained} stat points`], 160); } catch { /* cosmetic */ }
 
     system.runTimeout(() => {
         try {
@@ -250,6 +326,7 @@ function openSystemAnimated(player, retry = 1) {
     safeSound(player, "block.beacon.activate", { pitch: 1.6, volume: 0.6 });
     facePuff(player);
     setActionBar(player, "§b「 ACCESSING SYSTEM 」");
+    try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
     system.runTimeout(() => {
         try { if (player.isValid) openSystem(player, retry); } catch { /* ignore */ }
     }, 8);
