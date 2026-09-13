@@ -200,6 +200,37 @@ function showHologram(player, lines, duration = HOLO_TICKS) {
     } catch { /* ignore */ }
 }
 
+function hasHologram(player) {
+    try {
+        for (const e of player.dimension.getEntities({ tags: [HOLO_TAG] })) {
+            try { if (e.getDynamicProperty("lu_owner") === player.id) return true; } catch { /* ignore */ }
+        }
+    } catch { /* ignore */ }
+    return false;
+}
+
+// Banish the board: poof where it was, then clear. Only fires if one is up,
+// so random jump-sneaking never spams sound.
+function dismissHologram(player) {
+    try {
+        if (!hasHologram(player)) return;
+        try {
+            for (const e of player.dimension.getEntities({ tags: [HOLO_TAG] })) {
+                try {
+                    if (e.getDynamicProperty("lu_owner") === player.id) {
+                        burstAt(player.dimension, e.location, "ring",
+                            ["minecraft:totem_particle", "minecraft:mobspell_emitter"], 8, 0.8);
+                        break;
+                    }
+                } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
+        clearHologram(player);
+        safeSound(player, "block.beacon.deactivate", { pitch: 1.3, volume: 0.6 });
+        setActionBar(player, "§7「 SYSTEM DISMISSED 」");
+    } catch { /* ignore */ }
+}
+
 function statusHoloLines(s) {
     return [
         "§l§bS Y S T E M",
@@ -342,13 +373,22 @@ system.runInterval(() => {
             if (!player.isValid) continue;
             let g = gesture.get(player.id);
             if (!g) {
-                g = { jumps: 0, windowStart: 0, lastVy: 0, cooldownUntil: 0 };
+                g = { jumps: 0, windowStart: 0, lastVy: 0, cooldownUntil: 0, wasSneaking: false, airJumpTick: -1000 };
                 gesture.set(player.id, g);
             }
             let vy = 0;
             try { vy = player.getVelocity()?.y ?? 0; } catch { vy = 0; }
             const rising = g.lastVy <= 0.3 && vy > 0.35;
             g.lastVy = vy;
+
+            const sneaking = player.isSneaking;
+            if (rising && !sneaking) g.airJumpTick = now;
+            // Dismiss = the reverse of open: jump first, then sneak mid-air.
+            // |vy| check keeps it mid-air only, so landing-then-sneaking won't banish.
+            if (sneaking && !g.wasSneaking && now - g.airJumpTick < 40 && Math.abs(vy) > 0.05) {
+                dismissHologram(player);
+            }
+            g.wasSneaking = sneaking;
 
             if (!player.isSneaking) {
                 // Window expired while not sneaking: drop stale progress.

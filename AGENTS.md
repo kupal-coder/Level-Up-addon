@@ -7,6 +7,7 @@ Level-Up-addon — Minecraft Bedrock (MCPE) stats addon. Solo-leveling SYSTEM wi
 - `LevelUp_BP/` — behavior pack. `manifest.json` (format_version 2, `@minecraft/server` 2.0.0 + `@minecraft/server-ui` 2.0.0, `min_engine_version` [1,21,0]).
 - `LevelUp_BP/scripts/main.js` — entire logic: gesture detect, XP/levels, SYSTEM form, STR/DUR/AGI effects. Balance knobs at top (`POINTS_PER_LEVEL`, `STR_DMG_PER_POINT`, `HP_PER_DUR`, `MAX_STAT`).
 - Physical SYSTEM hologram: named `area_effect_cloud`s tagged `lu_holo` (`lu_owner`/`lu_slot`/`lu_until` props), kept floating in front of the owner's view by a 5-tick interval. Cosmetic layer only — the form is the source of truth.
+- Gestures: open = sneak + 2 jumps (`airJumpTick` unused there); dismiss = plain jump then sneak-start mid-air (`|vy| > 0.05` guards against landed sneaks, `hasHologram` gates sound spam).
 - No resource pack, no CI, no build step — plain JS loaded by the game.
 
 ## Verify

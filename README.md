@@ -4,6 +4,7 @@ Solo-leveling style stats system for Minecraft Bedrock.
 
 - **Sneak + jump twice** (while crouching, within ~3 seconds) → the **SYSTEM** window opens in front of you showing level, XP, stat points, and 3 attributes.
 - The SYSTEM is **physically there**: glowing stat-lines materialize ~2 blocks in front of your face and follow your view for ~12 seconds. The popup menu opens on top for spending points.
+- Dismiss it early with the reverse move: **jump, then sneak mid-air**.
 - Typing `stats` or `system` in chat opens it too (mobile-friendly fallback).
 
 ## Stats
