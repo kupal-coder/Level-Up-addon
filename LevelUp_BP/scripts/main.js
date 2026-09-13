@@ -167,9 +167,11 @@ const HOLO_GAP = 0.32; // vertical gap between lines
 function holoAnchor(player, slot) {
     const dir = player.getViewDirection();
     const head = player.getHeadLocation();
+    // Never sink the board below waist height (e.g. looking straight down).
+    const y = Math.max(head.y + dir.y * 2.4 + 0.5 - slot * HOLO_GAP, head.y - 1.0);
     return {
         x: head.x + dir.x * 2.4,
-        y: head.y + dir.y * 2.4 + 0.5 - slot * HOLO_GAP,
+        y,
         z: head.z + dir.z * 2.4,
     };
 }
