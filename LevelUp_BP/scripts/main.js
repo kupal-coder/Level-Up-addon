@@ -38,13 +38,34 @@ function saveStats(player, s) {
     player.setDynamicProperty("lu_agi", s.agi);
 }
 
+let maxHpWritable = undefined; // lazily probed: does effectiveMax assignment stick?
+
 function applyDurability(player, heal = 0) {
     try {
         const s = loadStats(player);
         const hp = player.getComponent("health");
         if (!hp) return;
-        hp.effectiveMax = 20 + s.dur * HP_PER_DUR;
-        if (heal > 0) hp.currentValue = Math.min(hp.currentValue + heal, hp.effectiveMax);
+        const want = 20 + s.dur * HP_PER_DUR;
+        if (maxHpWritable !== false) {
+            try { hp.effectiveMax = want; } catch { maxHpWritable = false; }
+            try {
+                if (hp.effectiveMax >= want - 0.001) {
+                    maxHpWritable = true;
+                    if (heal > 0) hp.currentValue = Math.min(hp.currentValue + heal, hp.effectiveMax);
+                    return;
+                }
+            } catch { /* readback failed */ }
+            maxHpWritable = false;
+        }
+        // Fallback: health_boost effect (+4 max HP per level), kept alive by the 100-tick loop.
+        if (s.dur > 0) {
+            try {
+                player.addEffect("health_boost", 140, {
+                    amplifier: Math.max(0, Math.ceil(s.dur / 2) - 1),
+                    showParticles: false,
+                });
+            } catch { /* ignore */ }
+        }
     } catch { /* player left mid-tick */ }
 }
 
@@ -315,6 +336,8 @@ world.afterEvents.entityDie.subscribe((ev) => {
 });
 
 // ---- STR: bonus damage on melee hits (with crit spark) ----
+const bonusHitAt = new Map(); // victimId -> tick of last bonus damage (anti-recursion)
+
 world.afterEvents.entityHitEntity.subscribe((ev) => {
     try {
         const hitter = ev.damagingEntity;
@@ -326,6 +349,13 @@ world.afterEvents.entityHitEntity.subscribe((ev) => {
         system.run(() => {
             try {
                 if (!target.isValid) return;
+                const now = system.currentTick;
+                // Guard: if applyDamage ever re-fires this event, never stack with our own bonus.
+                if (now - (bonusHitAt.get(target.id) ?? -100) < 5) return;
+                bonusHitAt.set(target.id, now);
+                if (bonusHitAt.size > 200) {
+                    for (const [id, t] of bonusHitAt) if (now - t > 20) bonusHitAt.delete(id);
+                }
                 target.applyDamage(bonus, { damagingEntity: hitter });
                 try {
                     burstAt(target.dimension, target.location, "hit",
@@ -343,7 +373,7 @@ world.afterEvents.playerSpawn.subscribe((ev) => {
     }, 10);
 });
 
-// ---- AGI speed refresh + high-level idle aura ----
+// ---- AGI speed refresh + DUR fallback upkeep + high-level idle aura ----
 system.runInterval(() => {
     for (const player of world.getPlayers()) {
         try {
@@ -354,6 +384,8 @@ system.runInterval(() => {
                     player.addEffect("speed", 140, { amplifier: agiAmplifier(agi), showParticles: false });
                 } catch { /* effect unavailable */ }
             }
+            // If direct max-HP writes are unsupported, re-apply DUR via health_boost here.
+            if (maxHpWritable === false) applyDurability(player);
             const level = num(player.getDynamicProperty("lu_level"), 1);
             if (level >= AURA_MIN_LEVEL) {
                 try {
