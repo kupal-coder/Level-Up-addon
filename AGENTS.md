@@ -14,5 +14,6 @@ Level-Up-addon — Minecraft Bedrock (MCPE) stats addon. Solo-leveling SYSTEM wi
 
 - `node --check LevelUp_BP/scripts/main.js` and JSON-parse `LevelUp_BP/manifest.json`. No toolchain beyond that; in-game load test is the real check.
 - Keep Script API usage to stable 2.0.0 surface only (`world`, `system`, `ActionFormData`, dynamic properties, `health`/`speed`/`health_boost` effects) so `min_engine_version` [1,21,0] stays valid.
+- Release convention: pack display name carries the version (`Level Up vX.Y.Z` in `manifest.json` header). Every update bumps all three together: header `name`, header `version`, and the `LevelUp_vX.Y.Z.mcpack` filename (only one current mcpack in the repo).
 - `health.effectiveMax` is read-only: `applyDurability` probes write+readback once and falls back to a maintained `health_boost` effect. STR bonus damage has a per-victim 5-tick anti-recursion guard (`bonusHitAt`). Don't remove either without in-game proof.
 - All FX helpers in `main.js` (`safeSound`, `safeCommand`, `burstAt`, `spiralUp`, `levelUpCinematic`) are best-effort try/catch — keep that pattern for any new juice. Particle ids fall back through candidate lists; camera shake/fade are `runCommand` and need cheats ON.
