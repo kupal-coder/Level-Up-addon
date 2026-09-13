@@ -1,12 +1,14 @@
 # AGENTS.md
 
-Level-Up-addon — intended Minecraft Bedrock (MCPE) addon (per GitHub repo description). Currently an empty scaffold.
+Level-Up-addon — Minecraft Bedrock (MCPE) stats addon. Solo-leveling SYSTEM window: sneak + double-jump opens level / stat-points / STR-DUR-AGI screen.
 
-## State (verified 2026-09-13)
+## Layout (source of truth)
 
-- Only file is `LICENSE` (MIT). No `README`, no `manifest.json`, no behavior/resource packs, no source, no workflows.
-- No build, test, lint, or verification commands exist. Do not invent any.
+- `LevelUp_BP/` — behavior pack. `manifest.json` (format_version 2, `@minecraft/server` 2.0.0 + `@minecraft/server-ui` 2.0.0, `min_engine_version` [1,21,0]).
+- `LevelUp_BP/scripts/main.js` — entire logic: gesture detect, XP/levels, SYSTEM form, STR/DUR/AGI effects. Balance knobs at top (`POINTS_PER_LEVEL`, `STR_DMG_PER_POINT`, `HP_PER_DUR`, `MAX_STAT`).
+- No resource pack, no CI, no build step — plain JS loaded by the game.
 
-## Rule
+## Verify
 
-- When real addon content lands, update this file with the actual pack layout and the exact in-game load-test steps. Until then, keep it minimal.
+- `node --check LevelUp_BP/scripts/main.js` and JSON-parse `LevelUp_BP/manifest.json`. No toolchain beyond that; in-game load test is the real check.
+- Keep Script API usage to stable 2.0.0 surface only (`world`, `system`, `ActionFormData`, dynamic properties, `health`/`speed` effects) so `min_engine_version` [1,21,0] stays valid.
