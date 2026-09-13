@@ -8,6 +8,7 @@ const HP_PER_DUR = 2; // +1 heart per DUR (20 = 10 hearts base)
 const XP_WINDOW_NOTE = 60; // ticks to land both jumps while sneaking
 const UI_COOLDOWN = 60; // ticks after opening before gesture works again
 const MAX_STAT = 50;
+const AURA_MIN_LEVEL = 5; // level at which players get an idle wisp aura
 
 const xpNext = (level) => level * 50;
 
@@ -51,6 +52,122 @@ function agiAmplifier(agi) {
     return Math.min(4, Math.floor(agi / 5));
 }
 
+// ============================================================
+// FX — all best-effort, never allowed to break the tick loop.
+// Camera commands need cheats ON; particles/sounds/titles do not.
+// ============================================================
+function safeSound(player, id, opts) {
+    try { player.playSound(id, opts); } catch { /* unknown sound on this version */ }
+}
+
+function safeCommand(player, cmd) {
+    try { player.runCommand(cmd); } catch { /* cheats off or unknown command */ }
+}
+
+function setActionBar(player, text) {
+    try { player.onScreenDisplay.setActionBar(text); } catch { /* HUD unavailable */ }
+}
+
+// First working particle id wins and is cached per effect key.
+const particleCache = {};
+function burstAt(dimension, loc, key, ids, count, spread = 0.6) {
+    try {
+        let id = particleCache[key];
+        const candidates = id ? [id] : ids;
+        for (const cand of candidates) {
+            try {
+                for (let i = 0; i < count; i++) {
+                    dimension.spawnParticle(cand, {
+                        x: loc.x + (Math.random() - 0.5) * spread * 2,
+                        y: loc.y + Math.random() * 0.8,
+                        z: loc.z + (Math.random() - 0.5) * spread * 2,
+                    });
+                }
+                particleCache[key] = cand;
+                return;
+            } catch { /* try next candidate */ }
+        }
+    } catch { /* dimension unloaded */ }
+}
+
+function ringBurst(player, count) {
+    try {
+        burstAt(player.dimension, player.location, "ring",
+            ["minecraft:totem_particle", "minecraft:mobspell_emitter", "minecraft:villager_happy"],
+            count, 0.9);
+    } catch { /* ignore */ }
+}
+
+// Rising spiral around the player for ~1.2s. Pure juice.
+function spiralUp(player, total) {
+    try {
+        const dim = player.dimension;
+        const cx = player.location.x, cy = player.location.y, cz = player.location.z;
+        let step = 0;
+        const per = 3;
+        const runId = system.runInterval(() => {
+            try {
+                for (let k = 0; k < per; k++) {
+                    const t = step * per + k;
+                    const a = t * 0.55;
+                    const r = 1.1 - t * 0.02;
+                    burstAt(dim, { x: cx + Math.cos(a) * r, y: cy + t * 0.12, z: cz + Math.sin(a) * r },
+                        "trail", ["minecraft:enchanting_table_particle", "minecraft:mobspell_emitter"], 1, 0.1);
+                }
+                step += 1;
+                if (step * per >= total) system.clearRun(runId);
+            } catch {
+                try { system.clearRun(runId); } catch { /* already cleared */ }
+            }
+        }, 2);
+    } catch { /* ignore */ }
+}
+
+// Puff of particles 2 blocks in front of the player's face:
+// the SYSTEM materializing before them.
+function facePuff(player) {
+    try {
+        const dir = player.getViewDirection();
+        const head = player.getHeadLocation();
+        burstAt(player.dimension,
+            { x: head.x + dir.x * 2, y: head.y + dir.y * 2, z: head.z + dir.z * 2 },
+            "ring", ["minecraft:totem_particle", "minecraft:mobspell_emitter", "minecraft:villager_happy"], 6, 0.4);
+    } catch { /* ignore */ }
+}
+
+// ---- LEVEL UP cinematic (~2.5s): shake + fade + spiral + ARISE + title ----
+function levelUpCinematic(player, level, pointsGained) {
+    safeCommand(player, `camerashake add @s 0.35 1.2 rotational`);
+    safeCommand(player, `camera @s fade time 0.2 1.0 0.6 color 12 4 32`);
+    safeSound(player, "mob.enderdragon.growl", { pitch: 0.5, volume: 0.8 });
+    ringBurst(player, 10 + pointsGained * 2);
+    spiralUp(player, 20 + pointsGained * 4);
+
+    system.runTimeout(() => {
+        try {
+            if (!player.isValid) return;
+            safeSound(player, "block.beacon.activate", { pitch: 1.2 });
+            setActionBar(player, "§d§l✦ A R I S E ✦");
+        } catch { /* ignore */ }
+    }, 12);
+
+    system.runTimeout(() => {
+        try {
+            if (!player.isValid) return;
+            try {
+                player.onScreenDisplay.setTitle("§l§eLEVEL UP!", {
+                    subtitle: `§7Level ${level}  •  §e+${pointsGained} stat points`,
+                    fadeInDuration: 5, stayDuration: 45, fadeOutDuration: 12,
+                });
+            } catch { /* HUD unavailable */ }
+            safeSound(player, "random.levelup");
+            safeSound(player, "random.totem", { pitch: 1.1, volume: 0.7 });
+            safeCommand(player, `camerashake add @s 0.25 0.8 positional`);
+            ringBurst(player, 14);
+        } catch { /* ignore */ }
+    }, 26);
+}
+
 // ---- SYSTEM window ----
 function openSystem(player, retry = 1) {
     let s;
@@ -85,6 +202,7 @@ function openSystem(player, retry = 1) {
         if (res.selection === 3) return; // Close
         if (st.points <= 0) {
             player.sendMessage("§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
+            safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
             return;
         }
         const key = res.selection === 0 ? "str" : res.selection === 1 ? "dur" : "agi";
@@ -97,9 +215,23 @@ function openSystem(player, retry = 1) {
         st.points -= 1;
         saveStats(player, st);
         if (key === "dur") applyDurability(player, HP_PER_DUR);
+        // Spend FX: pitch climbs with the new value, spark burst, action bar flash.
+        safeSound(player, "random.orb", { pitch: 0.7 + Math.min(st[key], 25) * 0.03, volume: 0.8 });
+        ringBurst(player, 4);
+        setActionBar(player, `§e${names[key]} §7→ §f${st[key]}`);
         player.sendMessage(`§b[SYSTEM] §f${names[key]} §7→ §f${st[key]} §8(${st.points} points left)`);
         system.runTimeout(() => openSystem(player, 0), 5);
     }).catch(() => { /* player offline / in another UI */ });
+}
+
+// Animated entrance before the form: materialize FX, then open.
+function openSystemAnimated(player, retry = 1) {
+    safeSound(player, "block.beacon.activate", { pitch: 1.6, volume: 0.6 });
+    facePuff(player);
+    setActionBar(player, "§b「 ACCESSING SYSTEM 」");
+    system.runTimeout(() => {
+        try { if (player.isValid) openSystem(player, retry); } catch { /* ignore */ }
+    }, 8);
 }
 
 // ---- Gesture: sneaking + 2 jumps ----
@@ -136,7 +268,7 @@ system.runInterval(() => {
                 if (g.jumps >= 2) {
                     g.jumps = 0;
                     g.cooldownUntil = now + UI_COOLDOWN;
-                    openSystem(player);
+                    openSystemAnimated(player);
                 }
             } else if (g.jumps > 0 && now - g.windowStart > XP_WINDOW_NOTE) {
                 g.jumps = 0;
@@ -172,19 +304,17 @@ world.afterEvents.entityDie.subscribe((ev) => {
         }
         saveStats(killer, s);
         if (ups > 0) {
-            try {
-                killer.onScreenDisplay.setTitle(`§l§eLEVEL UP!`, {
-                    subtitle: `§7Level ${s.level}  •  §e+${ups * POINTS_PER_LEVEL} stat points`,
-                    fadeInDuration: 5, stayDuration: 40, fadeOutDuration: 10,
-                });
-            } catch { /* HUD unavailable */ }
-            try { killer.playSound("random.levelup"); } catch { /* no sound */ }
+            levelUpCinematic(killer, s.level, ups * POINTS_PER_LEVEL);
             killer.sendMessage(`§b[SYSTEM] §7Level §f${s.level}§7! Sneak + double-jump to open your status.`);
+        } else {
+            // Kill feedback: XP blip on the action bar + orb sound.
+            setActionBar(killer, `§b+${gain} XP §8(${s.xp}/${xpNext(s.level)})`);
+            safeSound(killer, "random.orb", { pitch: 0.9, volume: 0.35 });
         }
     } catch { /* ignore */ }
 });
 
-// ---- STR: bonus damage on melee hits ----
+// ---- STR: bonus damage on melee hits (with crit spark) ----
 world.afterEvents.entityHitEntity.subscribe((ev) => {
     try {
         const hitter = ev.damagingEntity;
@@ -195,7 +325,12 @@ world.afterEvents.entityHitEntity.subscribe((ev) => {
         if (!target || !target.isValid) return;
         system.run(() => {
             try {
-                if (target.isValid) target.applyDamage(bonus, { damagingEntity: hitter });
+                if (!target.isValid) return;
+                target.applyDamage(bonus, { damagingEntity: hitter });
+                try {
+                    burstAt(target.dimension, target.location, "hit",
+                        ["minecraft:critical_hit_emitter", "minecraft:mobspell_emitter"], 3, 0.4);
+                } catch { /* particles unavailable */ }
             } catch { /* target despawned */ }
         });
     } catch { /* ignore */ }
@@ -208,14 +343,25 @@ world.afterEvents.playerSpawn.subscribe((ev) => {
     }, 10);
 });
 
-// ---- AGI: refresh Speed effect ----
+// ---- AGI speed refresh + high-level idle aura ----
 system.runInterval(() => {
     for (const player of world.getPlayers()) {
         try {
             if (!player.isValid) continue;
             const agi = num(player.getDynamicProperty("lu_agi"));
-            if (agi <= 0) continue;
-            player.addEffect("speed", 140, { amplifier: agiAmplifier(agi), showParticles: false });
+            if (agi > 0) {
+                try {
+                    player.addEffect("speed", 140, { amplifier: agiAmplifier(agi), showParticles: false });
+                } catch { /* effect unavailable */ }
+            }
+            const level = num(player.getDynamicProperty("lu_level"), 1);
+            if (level >= AURA_MIN_LEVEL) {
+                try {
+                    const head = player.getHeadLocation();
+                    burstAt(player.dimension, { x: head.x, y: head.y + 0.4, z: head.z },
+                        "aura", ["minecraft:obsidian_glow_particle", "minecraft:enchanting_table_particle"], 2, 0.5);
+                } catch { /* ignore */ }
+            }
         } catch { /* ignore */ }
     }
 }, 100);
@@ -229,7 +375,7 @@ world.beforeEvents.chatSend.subscribe((ev) => {
             try {
                 const g = gesture.get(ev.sender.id);
                 if (g) g.cooldownUntil = system.currentTick + UI_COOLDOWN;
-                openSystem(ev.sender);
+                openSystemAnimated(ev.sender);
             } catch { /* ignore */ }
         });
     }

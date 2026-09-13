@@ -15,6 +15,18 @@ Solo-leveling style stats system for Minecraft Bedrock.
 
 Killing mobs grants XP (stronger mobs = more XP). Each level-up gives **3 stat points**.
 
+## Cinematic touches
+
+- **Level up:** screen shake + dark fade, rising particle spiral, deep growl → *✦ ARISE ✦* → LEVEL UP title with fanfare.
+- **Opening the SYSTEM:** beacon sound, particles materializing in front of your face, *ACCESSING SYSTEM* flash.
+- **Spending a point:** pitch-climbing orb chime, spark burst, action-bar flash.
+- **Every kill:** +XP action-bar blip with orb sound.
+- **Level 5+:** idle wisp aura.
+
+> Camera shake/fade are commands, so they need **cheats ON**. Everything else
+> (particles, sounds, titles) works with cheats off — the cinematic just
+> degrades gracefully.
+
 ## Install
 
 1. Copy `LevelUp_BP` to your `development_behavior_packs` folder (or zip it as `.mcpack`).

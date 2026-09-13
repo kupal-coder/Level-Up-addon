@@ -12,3 +12,4 @@ Level-Up-addon — Minecraft Bedrock (MCPE) stats addon. Solo-leveling SYSTEM wi
 
 - `node --check LevelUp_BP/scripts/main.js` and JSON-parse `LevelUp_BP/manifest.json`. No toolchain beyond that; in-game load test is the real check.
 - Keep Script API usage to stable 2.0.0 surface only (`world`, `system`, `ActionFormData`, dynamic properties, `health`/`speed` effects) so `min_engine_version` [1,21,0] stays valid.
+- All FX helpers in `main.js` (`safeSound`, `safeCommand`, `burstAt`, `spiralUp`, `levelUpCinematic`) are best-effort try/catch — keep that pattern for any new juice. Particle ids fall back through candidate lists; camera shake/fade are `runCommand` and need cheats ON.
