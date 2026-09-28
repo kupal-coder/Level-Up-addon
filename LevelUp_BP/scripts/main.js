@@ -87,9 +87,11 @@ function applyDurability(player, heal = 0) {
 
         if (s.dur <= 0) {
             // Nothing to grant; drop a boost left over from a previous build/stat reset.
-            if (maxHpWritable === false) {
-                try { player.removeEffect("health_boost"); } catch { /* ignore */ }
-            }
+            // Deliberately NOT gated on maxHpWritable: this branch returns before the
+            // probe below ever runs, so gating it meant that on a fresh session where no
+            // player has durability the flag stayed `undefined` forever and a phantom
+            // boost survived every upkeep pass (and the form kept reporting its HP).
+            try { player.removeEffect("health_boost"); } catch { /* ignore */ }
             return;
         }
 
@@ -132,6 +134,17 @@ function applyDurability(player, heal = 0) {
 
 function agiAmplifier(agi) {
     return Math.min(4, Math.floor(agi / 5));
+}
+
+// Single place that (re)grants the AGI speed effect, so joining/respawning and the
+// upkeep loop can never drift apart. 200 ticks > the 100-tick refresh, so the effect
+// is always present between passes and never blinks out.
+function applyAgility(player) {
+    try {
+        const agi = num(player.getDynamicProperty("lu_agi"));
+        if (agi <= 0) return;
+        player.addEffect("speed", 200, { amplifier: agiAmplifier(agi), showParticles: false });
+    } catch { /* effect unavailable */ }
 }
 
 // ============================================================
@@ -230,6 +243,16 @@ const HOLO_TICKS = 240; // 12s per summon
 const HOLO_GAP = 0.32; // vertical gap between lines
 const DIMENSION_IDS = ["minecraft:overworld", "minecraft:nether", "minecraft:the_end"];
 
+// A script-spawned area_effect_cloud carries the vanilla `Duration` component
+// (30 ticks) and the engine despawns it on its own; stable 2.0.0 has no
+// `setComponent` to stretch that, so the board used to blink out after ~1.5s
+// instead of the documented 12s no matter what the keeper did. Each line is
+// therefore rotated a few ticks before the engine would eat it, which keeps every
+// line continuously on screen instead of respawning it only once it is already gone.
+const AEC_LIFETIME_TICKS = 30; // engine-side: vanilla `Duration` on a spawned cloud
+const AEC_ROTATE_TICKS = AEC_LIFETIME_TICKS - 5; // our margin; must stay below the above
+const holoBoards = new Map(); // playerId -> { lines: string[], until: number }
+
 // Holo lines must be findable from *any* dimension: a player can leave through a
 // portal (or log out) with a board up, and those clouds would otherwise linger
 // forever in a dimension nobody scans.
@@ -258,9 +281,23 @@ function holoAnchor(player, slot) {
 function clearHologram(player) {
     const id = player?.id;
     if (id === undefined) return;
+    holoBoards.delete(id);
     for (const e of holoEntities()) {
         try { if (e.getDynamicProperty("lu_owner") === id) e.remove(); } catch { /* ignore */ }
     }
+}
+
+function spawnHoloLine(player, text, slot, until) {
+    try {
+        const e = player.dimension.spawnEntity("minecraft:area_effect_cloud", holoAnchor(player, slot));
+        e.nameTag = text;
+        e.addTag(HOLO_TAG);
+        e.setDynamicProperty("lu_owner", player.id);
+        e.setDynamicProperty("lu_slot", slot);
+        e.setDynamicProperty("lu_until", until);
+        e.setDynamicProperty("lu_born", system.currentTick);
+        return e;
+    } catch { return undefined; }
 }
 
 function showHologram(player, lines, duration = HOLO_TICKS) {
@@ -268,20 +305,13 @@ function showHologram(player, lines, duration = HOLO_TICKS) {
         if (!player.isValid) return;
         clearHologram(player);
         const until = system.currentTick + duration;
-        lines.forEach((text, slot) => {
-            try {
-                const e = player.dimension.spawnEntity("minecraft:area_effect_cloud", holoAnchor(player, slot));
-                e.nameTag = text;
-                e.addTag(HOLO_TAG);
-                e.setDynamicProperty("lu_owner", player.id);
-                e.setDynamicProperty("lu_slot", slot);
-                e.setDynamicProperty("lu_until", until);
-            } catch { /* spawn failed */ }
-        });
+        holoBoards.set(player.id, { lines, until });
+        lines.forEach((text, slot) => { spawnHoloLine(player, text, slot, until); });
     } catch { /* ignore */ }
 }
 
 function hasHologram(player) {
+    if (holoBoards.has(player.id)) return true;
     for (const e of holoEntities()) {
         try { if (e.getDynamicProperty("lu_owner") === player.id) return true; } catch { /* ignore */ }
     }
@@ -317,9 +347,10 @@ function statusHoloLines(s) {
     ];
 }
 
-// Keeper, every 5 ticks: expire old lines + keep active ones floating in front
-// of their owner's view. Driven from the entities (not from online players), so
-// boards whose owner logged out or changed dimension are cleaned up too.
+// Keeper, every 5 ticks: expire old lines, re-create lines the engine despawned,
+// and keep the rest floating in front of their owner's view. The entity sweep
+// (rather than a player list) is what cleans up boards whose owner logged out or
+// walked through a portal, so that half stays entity-driven.
 system.runInterval(() => {
     try {
         const now = system.currentTick;
@@ -327,6 +358,7 @@ system.runInterval(() => {
         for (const p of world.getPlayers()) {
             try { online.set(p.id, p); } catch { /* ignore */ }
         }
+        const live = new Map(); // `${ownerId}|${slot}` -> entity still on the board
         for (const e of holoEntities()) {
             try {
                 const ownerId = e.getDynamicProperty("lu_owner");
@@ -334,8 +366,26 @@ system.runInterval(() => {
                 if (!owner || !owner.isValid) { e.remove(); continue; }
                 if (now > num(e.getDynamicProperty("lu_until"), 0)) { e.remove(); continue; }
                 if (e.dimension.id !== owner.dimension.id) { e.remove(); continue; }
-                e.teleport(holoAnchor(owner, num(e.getDynamicProperty("lu_slot"), 0)));
+                live.set(`${ownerId}|${num(e.getDynamicProperty("lu_slot"), 0)}`, e);
             } catch { try { e.remove(); } catch { /* gone */ } }
+        }
+        for (const [id, board] of holoBoards) {
+            const owner = online.get(id);
+            if (!owner || !owner.isValid) { holoBoards.delete(id); continue; }
+            if (now > board.until) { clearHologram(owner); continue; }
+            board.lines.forEach((text, slot) => {
+                const e = live.get(`${id}|${slot}`);
+                if (!e) { spawnHoloLine(owner, text, slot, board.until); return; }
+                // Rotate before the engine despawns this cloud. Spawning the
+                // replacement first means the slot is never empty, so the board
+                // does not blink once per line per AEC_LIFETIME_TICKS.
+                if (now - num(e.getDynamicProperty("lu_born"), 0) < AEC_ROTATE_TICKS) {
+                    try { e.teleport(holoAnchor(owner, slot)); } catch { /* moved on */ }
+                } else {
+                    spawnHoloLine(owner, text, slot, board.until);
+                    try { e.remove(); } catch { /* already gone */ }
+                }
+            });
         }
     } catch { /* ignore */ }
 }, 5);
@@ -416,15 +466,17 @@ function openSystem(player, retry = 1) {
         const names = { str: "Strength", dur: "Durability", agi: "Agility" };
         if (st[key] >= MAX_STAT) {
             tell(player, `§b[SYSTEM] §7${names[key]} is maxed (${MAX_STAT}).`);
+            safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
+            // Re-open anyway: the points are still theirs to spend on another stat, and
+            // returning here without a form strands them until they redo the gesture.
+            system.runTimeout(() => openSystem(player, 1), 10);
             return;
         }
         st[key] += 1;
         st.points -= 1;
         saveStats(player, st);
         if (key === "dur") applyDurability(player, HP_PER_DUR);
-        if (key === "agi") {
-            try { player.addEffect("speed", 200, { amplifier: agiAmplifier(st.agi), showParticles: false }); } catch { /* ignore */ }
-        }
+        if (key === "agi") applyAgility(player);
         // Spend FX: pitch climbs with the new value, spark burst, action bar flash.
         safeSound(player, "random.orb", { pitch: 0.7 + Math.min(st[key], 25) * 0.03, volume: 0.8 });
         ringBurst(player, 4);
@@ -573,6 +625,7 @@ system.runInterval(() => {
 try {
     world.afterEvents.playerLeave.subscribe((ev) => {
         gesture.delete(ev.playerId);
+        holoBoards.delete(ev.playerId);
     });
 } catch { /* ignore */ }
 
@@ -658,7 +711,11 @@ world.afterEvents.entityHurt.subscribe((ev) => {
 // ---- DUR: re-apply max HP on join / respawn ----
 world.afterEvents.playerSpawn.subscribe((ev) => {
     system.runTimeout(() => {
-        try { if (ev.player.isValid) applyDurability(ev.player); } catch { /* ignore */ }
+        try {
+            // AGI too: without this the upkeep loop was the only thing granting speed,
+            // so a respawn left the player walking at base speed for up to 5s.
+            if (ev.player.isValid) { applyAgility(ev.player); applyDurability(ev.player); }
+        } catch { /* ignore */ }
     }, 10);
 });
 
@@ -667,13 +724,7 @@ system.runInterval(() => {
     for (const player of world.getPlayers()) {
         try {
             if (!player.isValid) continue;
-            const agi = num(player.getDynamicProperty("lu_agi"));
-            if (agi > 0) {
-                try {
-                    // 200 ticks > the 100-tick refresh, so the effect never blinks out.
-                    player.addEffect("speed", 200, { amplifier: agiAmplifier(agi), showParticles: false });
-                } catch { /* effect unavailable */ }
-            }
+            applyAgility(player);
             // Keep the health_boost fallback alive (and grant it the first time round).
             if (maxHpWritable !== true) applyDurability(player);
             const level = num(player.getDynamicProperty("lu_level"), 1);

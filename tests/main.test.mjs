@@ -1,6 +1,11 @@
 import assert from "node:assert";
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { harness, advance, world, system } from "@minecraft/server";
 import { formLog } from "@minecraft/server-ui";
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 const results = [];
 async function t(name, fn) {
@@ -159,6 +164,21 @@ await t("AGI speed effect is always present between refreshes", () => {
     }
 });
 
+await t("AGI speed is applied on respawn, not just by the upkeep loop", () => {
+    advance(120);
+    const a = newPlayer("kate");
+    a.setDynamicProperty("lu_agi", 10);
+    // Land immediately after an upkeep pass, then wipe its effect, so the only
+    // thing that can restore speed before the next 100-tick pass is playerSpawn.
+    for (let i = 0; i < 100 && !a.getEffect("speed"); i++) advance(1);
+    assert.ok(a.getEffect("speed"), "never caught an upkeep boundary");
+    a.removeEffect("speed");
+    world.afterEvents.playerSpawn.emit({ player: a });
+    advance(15);
+    assert.ok(a.getEffect("speed"),
+        "no speed 15 ticks after respawn; the upkeep loop is up to 100 ticks away");
+});
+
 // --- 8. hologram lifecycle ---
 await t("hologram entities are cleaned up when the owner leaves", () => {
     advance(120);
@@ -182,6 +202,29 @@ await t("holograms expire after their duration", () => {
     assert.strictEqual(left, 0, left + " holograms never expired");
 });
 
+// The engine despawns a script-spawned area_effect_cloud after ~30 ticks on its
+// own (vanilla `Duration`; stable 2.0.0 has no setComponent to stretch it), so the
+// keeper has to keep the lines alive. Without that the board vanished after ~1.5s
+// instead of the 12s HOLO_TICKS promises, or - if it only respawned once a line was
+// already gone - left a 5-tick hole in the board every 30 ticks.
+await t("holo board stays complete for its whole lifetime", async () => {
+    advance(120);
+    formLog.respond = null;
+    const m = newPlayer("mara");
+    m.isSneaking = true;
+    jump(m); jump(m);
+    await advanceAsync(20);
+    const owned = () => harness.entities.filter((e) => e.tags.has("lu_holo") && e.getDynamicProperty("lu_owner") === m.id);
+    assert.ok(owned().length > 0, "no hologram spawned");
+    for (let i = 0; i < 200; i++) {
+        advance(1);
+        await flush();
+        assert.ok(owned().length >= 4, "board dropped below 4 lines at +" + i + " (" + owned().length + ")");
+    }
+    advance(60); // past HOLO_TICKS
+    assert.strictEqual(owned().length, 0, "board outlived its duration");
+});
+
 // --- 9. spending a point ---
 await t("spending a point on STR decrements points and bumps the stat", async () => {
     advance(120);
@@ -194,6 +237,22 @@ await t("spending a point on STR decrements points and bumps the stat", async ()
     await advanceAsync(40);
     assert.strictEqual(sp.getDynamicProperty("lu_str"), 1, "STR not incremented");
     assert.strictEqual(sp.getDynamicProperty("lu_points"), 1, "point not spent");
+    formLog.respond = null;
+});
+
+// --- 9b. a maxed stat must not strand the points the player still holds ---
+await t("maxing a stat reopens the form so the remaining points stay spendable", async () => {
+    advance(120);
+    const sp = newPlayer("pat");
+    sp.setDynamicProperty("lu_points", 5);
+    sp.setDynamicProperty("lu_str", 50); // already at MAX_STAT
+    formLog.respond = () => ({ canceled: false, selection: 0 }); // keeps tapping STR
+    formLog.shown.length = 0;
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sp });
+    await advanceAsync(30);
+    assert.ok(formLog.shown.length >= 2,
+        "form closed on a maxed stat, stranding " + sp.getDynamicProperty("lu_points") + " points");
+    assert.strictEqual(sp.getDynamicProperty("lu_points"), 5, "a point was spent on a maxed stat");
     formLog.respond = null;
 });
 
@@ -230,6 +289,14 @@ await t("gesture map does not leak after players leave", () => {
     harness.players = harness.players.filter((x) => x !== tmp);
     advance(5);
     assert.strictEqual(harness.players.length, before);
+});
+
+// --- 12. fresh-session regressions (own process) ---
+await t("stale health_boost is dropped before effectiveMax is ever probed", () => {
+    // Needs its own module registry: the bug only appears while the module-level
+    // maxHpWritable flag is still undefined, which this shared suite never is.
+    const r = spawnSync(process.execPath, [join(here, "stale-boost.test.mjs")], { encoding: "utf8" });
+    assert.strictEqual(r.status, 0, (r.stdout || "") + (r.stderr || ""));
 });
 
 let fails = 0;

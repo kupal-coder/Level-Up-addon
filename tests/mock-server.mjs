@@ -1,6 +1,12 @@
 // Minimal mock of the stable @minecraft/server 2.0.0 surface used by main.js.
 export const EntityDamageCause = { entityAttack: "entityAttack" };
 
+// The engine gives a script-spawned area_effect_cloud the vanilla `Duration`
+// component (30 ticks) and despawns it by itself; stable 2.0.0 exposes no
+// setComponent to stretch it. Modelling that here is what makes the holo board's
+// survival over HOLO_TICKS a testable property instead of an assumed one.
+export const AEC_LIFETIME_TICKS = 30;
+
 class Signal {
     constructor() { this.cbs = []; }
     subscribe(cb) { this.cbs.push(cb); return cb; }
@@ -30,6 +36,7 @@ class Dimension {
     }
     spawnEntity(typeId, loc) {
         const e = new Ent(typeId, this, loc);
+        e.bornTick = harness.tick;
         harness.entities.push(e);
         return e;
     }
@@ -132,6 +139,11 @@ export const system = {
 export function advance(n = 1) {
     for (let i = 0; i < n; i++) {
         harness.tick++;
+        // Self-despawning area_effect_clouds, exactly like the engine does.
+        for (const e of harness.entities.slice()) {
+            if (e.typeId === "minecraft:area_effect_cloud" &&
+                harness.tick - (e.bornTick ?? 0) >= AEC_LIFETIME_TICKS) e.remove();
+        }
         const due = harness.timers.filter((t) => t.at <= harness.tick);
         harness.timers = harness.timers.filter((t) => t.at > harness.tick);
         for (const t of due) t.cb();
