@@ -11,6 +11,10 @@ const JUMP_DEBOUNCE = 6; // ticks; one physical jump must only ever count once
 const SNEAK_GRACE = 12; // ticks a crouch still counts after jumping breaks it
 const UI_COOLDOWN = 60; // ticks after opening before gesture works again
 const MAX_STAT = 50;
+// agiAmplifier saturates at Speed V, so an Agility point past 20 changes nothing at
+// all. Without this the form happily swallowed 30 of a player's 50 points for no
+// effect whatsoever, and the tier line read "Speed 5" before and after.
+const AGI_CAP = 20;
 const AURA_MIN_LEVEL = 5; // level at which players get an idle wisp aura
 
 const xpNext = (level) => level * 50;
@@ -34,6 +38,9 @@ function loadStats(player) {
 
 function saveStats(player, s) {
     try {
+        // A half-written block would leave `lu_points` decremented without the
+        // matching stat bump, i.e. a silently destroyed point.
+        if (!player.isValid) return;
         player.setDynamicProperty("lu_level", s.level);
         player.setDynamicProperty("lu_xp", s.xp);
         player.setDynamicProperty("lu_points", s.points);
@@ -43,6 +50,12 @@ function saveStats(player, s) {
     } catch { /* player left mid-write */ }
 }
 
+// Highest value of `key` that still changes something. Agility saturates early;
+// Strength and Durability scale all the way to MAX_STAT.
+function statCap(key) {
+    return key === "agi" ? AGI_CAP : MAX_STAT;
+}
+
 // ---- DUR -> max HP ----
 // On @minecraft/server 2.0.0 every EntityAttributeComponent member is read-only:
 // `health.effectiveMax = n` throws in strict mode (modules are strict) and
@@ -50,6 +63,9 @@ function saveStats(player, s) {
 // maintained health_boost effect, and healing goes through setCurrentValue().
 // The direct write is still probed once in case a future engine allows it.
 let maxHpWritable = undefined; // undefined = not probed yet, false = use health_boost
+// Records the health_boost amplifier we last granted, so cleanup can tell our own
+// effect apart from one granted by /effect, a datapack or another addon.
+const BOOST_AMP_PROP = "lu_boost_amp";
 
 // health_boost grants +4 max HP per amplifier level (amplifier 0 == +4), so the
 // fallback can only step in 4s. Round to the nearest step instead of always
@@ -86,12 +102,19 @@ function applyDurability(player, heal = 0) {
         const want = 20 + s.dur * HP_PER_DUR;
 
         if (s.dur <= 0) {
-            // Nothing to grant; drop a boost left over from a previous build/stat reset.
-            // Deliberately NOT gated on maxHpWritable: this branch returns before the
-            // probe below ever runs, so gating it meant that on a fresh session where no
-            // player has durability the flag stayed `undefined` forever and a phantom
-            // boost survived every upkeep pass (and the form kept reporting its HP).
-            try { player.removeEffect("health_boost"); } catch { /* ignore */ }
+            // Nothing to grant. Drop a boost we applied earlier, but only when the
+            // amplifier matches the one we recorded: removeEffect is unconditional, so
+            // calling it blindly also destroys a health_boost from /effect or another
+            // addon. lu_dur never falls on its own, so dur === 0 means a stat reset —
+            // and the amplifier we wrote is the only reliable proof the boost is ours.
+            try {
+                const cur = player.getEffect("health_boost");
+                const mine = num(player.getDynamicProperty(BOOST_AMP_PROP), -1);
+                if (cur !== undefined && mine >= 0 && cur.amplifier === mine) {
+                    player.removeEffect("health_boost");
+                    player.setDynamicProperty(BOOST_AMP_PROP);
+                }
+            } catch { /* ignore */ }
             return;
         }
 
@@ -120,11 +143,16 @@ function applyDurability(player, heal = 0) {
         }
 
         // Fallback: health_boost, refreshed by the 100-tick upkeep loop below.
+        // addEffect is documented as "adds or updates", so writing unconditionally
+        // would clobber a stronger boost from another source. Maintain ours only when
+        // nothing stronger is active; equality still refreshes our duration.
+        const wantAmp = healthBoostAmplifier(s.dur);
         try {
-            player.addEffect("health_boost", 200, {
-                amplifier: healthBoostAmplifier(s.dur),
-                showParticles: false,
-            });
+            const cur = player.getEffect("health_boost");
+            if (cur === undefined || cur.amplifier <= wantAmp) {
+                player.addEffect("health_boost", 200, { amplifier: wantAmp, showParticles: false });
+                player.setDynamicProperty(BOOST_AMP_PROP, wantAmp);
+            }
         } catch { /* ignore */ }
         let cap = want;
         try { cap = hp.effectiveMax; } catch { /* ignore */ }
@@ -143,7 +171,14 @@ function applyAgility(player) {
     try {
         const agi = num(player.getDynamicProperty("lu_agi"));
         if (agi <= 0) return;
-        player.addEffect("speed", 200, { amplifier: agiAmplifier(agi), showParticles: false });
+        const want = agiAmplifier(agi);
+        // A beacon pyramid or a potion grants speed too, and addEffect "adds or
+        // updates" — so writing unconditionally downgraded a stronger speed to ours
+        // every upkeep pass. Leave a strictly stronger effect alone; equality still
+        // refreshes our duration, which is what stops the effect blinking out.
+        const cur = player.getEffect("speed");
+        if (cur !== undefined && cur.amplifier > want) return;
+        player.addEffect("speed", 200, { amplifier: want, showParticles: false });
     } catch { /* effect unavailable */ }
 }
 
@@ -439,7 +474,7 @@ function openSystem(player, retry = 1) {
             `§7Stat points: §e${s.points}\n\n` +
             `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg)\n` +
             `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP)\n` +
-            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"})\n\n` +
+            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"}${s.agi >= AGI_CAP ? " (max)" : ""})\n\n` +
             `§8Tap a stat to spend 1 point.`
         )
         .button("§c⚔ Strength +1")
@@ -464,8 +499,8 @@ function openSystem(player, retry = 1) {
         }
         const key = res.selection === 0 ? "str" : res.selection === 1 ? "dur" : "agi";
         const names = { str: "Strength", dur: "Durability", agi: "Agility" };
-        if (st[key] >= MAX_STAT) {
-            tell(player, `§b[SYSTEM] §7${names[key]} is maxed (${MAX_STAT}).`);
+        if (st[key] >= statCap(key)) {
+            tell(player, `§b[SYSTEM] §7${names[key]} is maxed (${statCap(key)}).`);
             safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
             // Re-open anyway: the points are still theirs to spend on another stat, and
             // returning here without a form strands them until they redo the gesture.

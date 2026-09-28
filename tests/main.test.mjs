@@ -146,9 +146,15 @@ await t("health_boost is refreshed by the upkeep loop and never expires", () => 
     assert.ok(d.getEffect("health_boost"), "health_boost lapsed");
 });
 
+// A boost the addon itself granted is ours to clean up when Durability is reset.
+// (A boost we never granted belongs to /effect, a datapack or another addon, and
+// removing it is a bug of its own - see the foreign-effect test further down.)
 await t("DUR 0 does not leave a stale health_boost", () => {
     const d = newPlayer("iris");
-    d.addEffect("health_boost", 200, { amplifier: 3 });
+    d.setDynamicProperty("lu_dur", 6);
+    advance(120);
+    assert.ok(d.getEffect("health_boost"), "precondition: no boost was granted");
+    d.setDynamicProperty("lu_dur", 0); // stat reset
     advance(120);
     assert.ok(!d.getEffect("health_boost"), "stale boost not cleared");
 });
@@ -254,6 +260,59 @@ await t("maxing a stat reopens the form so the remaining points stay spendable",
         "form closed on a maxed stat, stranding " + sp.getDynamicProperty("lu_points") + " points");
     assert.strictEqual(sp.getDynamicProperty("lu_points"), 5, "a point was spent on a maxed stat");
     formLog.respond = null;
+});
+
+// --- 9c. Agility saturates long before MAX_STAT ---
+// agiAmplifier is min(4, floor(agi/5)), so anything past AGI 20 bought literally
+// nothing while the form still showed "Speed 5" and cheerfully took the point.
+await t("Agility points past the cap cannot be spent", async () => {
+    advance(120);
+    const ag = newPlayer("vera");
+    ag.setDynamicProperty("lu_agi", 20); // Speed V: the last value that changes anything
+    ag.setDynamicProperty("lu_points", 5);
+    formLog.respond = () => ({ canceled: false, selection: 2 }); // keep tapping Agility
+    formLog.shown.length = 0;
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: ag });
+    await advanceAsync(30);
+    assert.strictEqual(ag.getDynamicProperty("lu_agi"), 20, "agi was raised past its cap");
+    assert.strictEqual(ag.getDynamicProperty("lu_points"), 5, "a point was burned on a no-op Agility purchase");
+    formLog.respond = null;
+});
+
+await t("Agility below the cap still spends normally", async () => {
+    advance(120);
+    const ag = newPlayer("wade");
+    ag.setDynamicProperty("lu_agi", 19);
+    ag.setDynamicProperty("lu_points", 5);
+    formLog.respond = () => ({ canceled: false, selection: 2 });
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: ag });
+    await advanceAsync(30);
+    assert.strictEqual(ag.getDynamicProperty("lu_agi"), 20, "agi did not reach its cap");
+    assert.strictEqual(ag.getDynamicProperty("lu_points"), 4, "the point was not spent");
+    formLog.respond = null;
+});
+
+// --- 9d. the upkeep must not clobber effects it did not grant ---
+// addEffect is "adds or updates", so writing our own amplifier unconditionally
+// downgraded a stronger effect every pass; removeEffect is worse still.
+await t("upkeep never downgrades a stronger speed from another source", async () => {
+    advance(120);
+    const sp = newPlayer("hal");
+    sp.setDynamicProperty("lu_agi", 1); // our Agility == Speed I
+    sp.addEffect("speed", 20000, { amplifier: 2 }); // e.g. a beacon pyramid
+    await advanceAsync(101);
+    assert.strictEqual(sp.getEffect("speed").amplifier, 2,
+        "a stronger speed was downgraded to amplifier " + sp.getEffect("speed").amplifier);
+});
+
+await t("upkeep never removes a health_boost from another source", async () => {
+    advance(120);
+    const hb = newPlayer("iris");
+    hb.setDynamicProperty("lu_dur", 0);
+    hb.addEffect("health_boost", 20000, { amplifier: 4 }); // /effect, a datapack, another addon
+    await advanceAsync(101);
+    assert.ok(hb.getEffect("health_boost") !== undefined, "a foreign health_boost was stripped");
+    assert.strictEqual(hb.getComponent("health").effectiveMax, 40, "foreign max HP was lost");
 });
 
 await t("Close button does not spend a point", async () => {
