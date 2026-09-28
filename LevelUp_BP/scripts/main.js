@@ -1,11 +1,14 @@
-import { world, system } from "@minecraft/server";
+import { world, system, EntityDamageCause } from "@minecraft/server";
 import { ActionFormData } from "@minecraft/server-ui";
 
 // ---- Tuning knobs ----
 const POINTS_PER_LEVEL = 3;
 const STR_DMG_PER_POINT = 0.5; // bonus melee damage per STR
 const HP_PER_DUR = 2; // +1 heart per DUR (20 = 10 hearts base)
-const XP_WINDOW_NOTE = 60; // ticks to land both jumps while sneaking
+const GESTURE_WINDOW = 60; // ticks to land both jumps while sneaking
+const DISMISS_WINDOW = 40; // ticks after a jump that a mid-air sneak banishes the board
+const JUMP_DEBOUNCE = 6; // ticks; one physical jump must only ever count once
+const SNEAK_GRACE = 12; // ticks a crouch still counts after jumping breaks it
 const UI_COOLDOWN = 60; // ticks after opening before gesture works again
 const MAX_STAT = 50;
 const AURA_MIN_LEVEL = 5; // level at which players get an idle wisp aura
@@ -30,42 +33,100 @@ function loadStats(player) {
 }
 
 function saveStats(player, s) {
-    player.setDynamicProperty("lu_level", s.level);
-    player.setDynamicProperty("lu_xp", s.xp);
-    player.setDynamicProperty("lu_points", s.points);
-    player.setDynamicProperty("lu_str", s.str);
-    player.setDynamicProperty("lu_dur", s.dur);
-    player.setDynamicProperty("lu_agi", s.agi);
+    try {
+        player.setDynamicProperty("lu_level", s.level);
+        player.setDynamicProperty("lu_xp", s.xp);
+        player.setDynamicProperty("lu_points", s.points);
+        player.setDynamicProperty("lu_str", s.str);
+        player.setDynamicProperty("lu_dur", s.dur);
+        player.setDynamicProperty("lu_agi", s.agi);
+    } catch { /* player left mid-write */ }
 }
 
-let maxHpWritable = undefined; // lazily probed: does effectiveMax assignment stick?
+// ---- DUR -> max HP ----
+// On @minecraft/server 2.0.0 every EntityAttributeComponent member is read-only:
+// `health.effectiveMax = n` throws in strict mode (modules are strict) and
+// `health.currentValue = n` silently does nothing. So max HP is granted with a
+// maintained health_boost effect, and healing goes through setCurrentValue().
+// The direct write is still probed once in case a future engine allows it.
+let maxHpWritable = undefined; // undefined = not probed yet, false = use health_boost
+
+// health_boost grants +4 max HP per amplifier level (amplifier 0 == +4), so the
+// fallback can only step in 4s. Round to the nearest step instead of always
+// rounding up, and report the real number in the UI (see maxHpOf) rather than
+// the ideal one, so the form never promises hearts the player does not have.
+function healthBoostAmplifier(dur) {
+    const steps = Math.max(1, Math.round((dur * HP_PER_DUR) / 4));
+    return Math.max(0, Math.min(255, steps - 1));
+}
+
+// Real max HP if the engine will tell us, otherwise the intended value.
+function maxHpOf(player, s) {
+    try {
+        const v = player.getComponent("health")?.effectiveMax;
+        if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.round(v);
+    } catch { /* unreadable */ }
+    return 20 + s.dur * HP_PER_DUR;
+}
+
+function healUpTo(hp, heal, cap) {
+    if (heal <= 0) return;
+    try {
+        const target = Math.min(hp.currentValue + heal, cap);
+        if (target > hp.currentValue) hp.setCurrentValue(target);
+    } catch { /* out of bounds / entity gone */ }
+}
 
 function applyDurability(player, heal = 0) {
     try {
+        if (!player.isValid) return;
         const s = loadStats(player);
         const hp = player.getComponent("health");
         if (!hp) return;
         const want = 20 + s.dur * HP_PER_DUR;
-        if (maxHpWritable !== false) {
+
+        if (s.dur <= 0) {
+            // Nothing to grant; drop a boost left over from a previous build/stat reset.
+            if (maxHpWritable === false) {
+                try { player.removeEffect("health_boost"); } catch { /* ignore */ }
+            }
+            return;
+        }
+
+        if (maxHpWritable === undefined) {
+            // Never probe while our own health_boost is up: its inflated effectiveMax
+            // would read back as "the write worked" after a script reload.
+            let boosted = false;
+            try { boosted = player.getEffect("health_boost") !== undefined; } catch { /* ignore */ }
+            if (boosted) {
+                maxHpWritable = false;
+            } else {
+                let wrote = true;
+                try { hp.effectiveMax = want; } catch { wrote = false; }
+                let readback = 0;
+                try { readback = hp.effectiveMax; } catch { readback = 0; }
+                maxHpWritable = wrote && readback >= want - 0.001;
+            }
+        }
+
+        if (maxHpWritable === true) {
             try { hp.effectiveMax = want; } catch { maxHpWritable = false; }
-            try {
-                if (hp.effectiveMax >= want - 0.001) {
-                    maxHpWritable = true;
-                    if (heal > 0) hp.currentValue = Math.min(hp.currentValue + heal, hp.effectiveMax);
-                    return;
-                }
-            } catch { /* readback failed */ }
-            maxHpWritable = false;
+            if (maxHpWritable === true) {
+                healUpTo(hp, heal, want);
+                return;
+            }
         }
-        // Fallback: health_boost effect (+4 max HP per level), kept alive by the 100-tick loop.
-        if (s.dur > 0) {
-            try {
-                player.addEffect("health_boost", 140, {
-                    amplifier: Math.max(0, Math.ceil(s.dur / 2) - 1),
-                    showParticles: false,
-                });
-            } catch { /* ignore */ }
-        }
+
+        // Fallback: health_boost, refreshed by the 100-tick upkeep loop below.
+        try {
+            player.addEffect("health_boost", 200, {
+                amplifier: healthBoostAmplifier(s.dur),
+                showParticles: false,
+            });
+        } catch { /* ignore */ }
+        let cap = want;
+        try { cap = hp.effectiveMax; } catch { /* ignore */ }
+        healUpTo(hp, heal, cap);
     } catch { /* player left mid-tick */ }
 }
 
@@ -85,6 +146,10 @@ function safeCommand(player, cmd) {
     try { player.runCommand(cmd); } catch { /* cheats off or unknown command */ }
 }
 
+function tell(player, text) {
+    try { player.sendMessage(text); } catch { /* player left */ }
+}
+
 function setActionBar(player, text) {
     try { player.onScreenDisplay.setActionBar(text); } catch { /* HUD unavailable */ }
 }
@@ -93,7 +158,7 @@ function setActionBar(player, text) {
 const particleCache = {};
 function burstAt(dimension, loc, key, ids, count, spread = 0.6) {
     try {
-        let id = particleCache[key];
+        const id = particleCache[key];
         const candidates = id ? [id] : ids;
         for (const cand of candidates) {
             try {
@@ -163,6 +228,20 @@ function facePuff(player) {
 const HOLO_TAG = "lu_holo";
 const HOLO_TICKS = 240; // 12s per summon
 const HOLO_GAP = 0.32; // vertical gap between lines
+const DIMENSION_IDS = ["minecraft:overworld", "minecraft:nether", "minecraft:the_end"];
+
+// Holo lines must be findable from *any* dimension: a player can leave through a
+// portal (or log out) with a board up, and those clouds would otherwise linger
+// forever in a dimension nobody scans.
+function holoEntities() {
+    const out = [];
+    for (const id of DIMENSION_IDS) {
+        try {
+            for (const e of world.getDimension(id).getEntities({ tags: [HOLO_TAG] })) out.push(e);
+        } catch { /* dimension not loaded */ }
+    }
+    return out;
+}
 
 function holoAnchor(player, slot) {
     const dir = player.getViewDirection();
@@ -177,11 +256,11 @@ function holoAnchor(player, slot) {
 }
 
 function clearHologram(player) {
-    try {
-        for (const e of player.dimension.getEntities({ tags: [HOLO_TAG] })) {
-            try { if (e.getDynamicProperty("lu_owner") === player.id) e.remove(); } catch { /* ignore */ }
-        }
-    } catch { /* ignore */ }
+    const id = player?.id;
+    if (id === undefined) return;
+    for (const e of holoEntities()) {
+        try { if (e.getDynamicProperty("lu_owner") === id) e.remove(); } catch { /* ignore */ }
+    }
 }
 
 function showHologram(player, lines, duration = HOLO_TICKS) {
@@ -203,11 +282,9 @@ function showHologram(player, lines, duration = HOLO_TICKS) {
 }
 
 function hasHologram(player) {
-    try {
-        for (const e of player.dimension.getEntities({ tags: [HOLO_TAG] })) {
-            try { if (e.getDynamicProperty("lu_owner") === player.id) return true; } catch { /* ignore */ }
-        }
-    } catch { /* ignore */ }
+    for (const e of holoEntities()) {
+        try { if (e.getDynamicProperty("lu_owner") === player.id) return true; } catch { /* ignore */ }
+    }
     return false;
 }
 
@@ -216,17 +293,15 @@ function hasHologram(player) {
 function dismissHologram(player) {
     try {
         if (!hasHologram(player)) return;
-        try {
-            for (const e of player.dimension.getEntities({ tags: [HOLO_TAG] })) {
-                try {
-                    if (e.getDynamicProperty("lu_owner") === player.id) {
-                        burstAt(player.dimension, e.location, "ring",
-                            ["minecraft:totem_particle", "minecraft:mobspell_emitter"], 8, 0.8);
-                        break;
-                    }
-                } catch { /* ignore */ }
-            }
-        } catch { /* ignore */ }
+        for (const e of holoEntities()) {
+            try {
+                if (e.getDynamicProperty("lu_owner") === player.id) {
+                    burstAt(e.dimension, e.location, "ring",
+                        ["minecraft:totem_particle", "minecraft:mobspell_emitter"], 8, 0.8);
+                    break;
+                }
+            } catch { /* ignore */ }
+        }
         clearHologram(player);
         safeSound(player, "block.beacon.deactivate", { pitch: 1.3, volume: 0.6 });
         setActionBar(player, "§7「 SYSTEM DISMISSED 」");
@@ -243,23 +318,24 @@ function statusHoloLines(s) {
 }
 
 // Keeper, every 5 ticks: expire old lines + keep active ones floating in front
-// of their owner's view. Scoped per online player, so no dimension-id guessing.
+// of their owner's view. Driven from the entities (not from online players), so
+// boards whose owner logged out or changed dimension are cleaned up too.
 system.runInterval(() => {
     try {
         const now = system.currentTick;
-        for (const owner of world.getPlayers()) {
+        const online = new Map();
+        for (const p of world.getPlayers()) {
+            try { online.set(p.id, p); } catch { /* ignore */ }
+        }
+        for (const e of holoEntities()) {
             try {
-                if (!owner.isValid) continue;
-                let list = [];
-                try { list = owner.dimension.getEntities({ tags: [HOLO_TAG] }); } catch { continue; }
-                for (const e of list) {
-                    try {
-                        if (e.getDynamicProperty("lu_owner") !== owner.id) continue;
-                        if (now > (e.getDynamicProperty("lu_until") ?? 0)) { e.remove(); continue; }
-                        e.teleport(holoAnchor(owner, e.getDynamicProperty("lu_slot") ?? 0));
-                    } catch { try { e.remove(); } catch { /* gone */ } }
-                }
-            } catch { /* skip this player */ }
+                const ownerId = e.getDynamicProperty("lu_owner");
+                const owner = typeof ownerId === "string" ? online.get(ownerId) : undefined;
+                if (!owner || !owner.isValid) { e.remove(); continue; }
+                if (now > num(e.getDynamicProperty("lu_until"), 0)) { e.remove(); continue; }
+                if (e.dimension.id !== owner.dimension.id) { e.remove(); continue; }
+                e.teleport(holoAnchor(owner, num(e.getDynamicProperty("lu_slot"), 0)));
+            } catch { try { e.remove(); } catch { /* gone */ } }
         }
     } catch { /* ignore */ }
 }, 5);
@@ -302,6 +378,7 @@ function levelUpCinematic(player, level, pointsGained) {
 function openSystem(player, retry = 1) {
     let s;
     try {
+        if (!player.isValid) return;
         s = loadStats(player);
     } catch { return; }
     const need = xpNext(s.level);
@@ -311,7 +388,7 @@ function openSystem(player, retry = 1) {
             `§7Level: §f${s.level}  §8(${s.xp}/${need} XP)\n` +
             `§7Stat points: §e${s.points}\n\n` +
             `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg)\n` +
-            `§a❤ Durability: §f${s.dur} §8(${20 + s.dur * HP_PER_DUR} max HP)\n` +
+            `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP)\n` +
             `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"})\n\n` +
             `§8Tap a stat to spend 1 point.`
         )
@@ -328,29 +405,35 @@ function openSystem(player, retry = 1) {
             }
             return;
         }
+        if (res.selection === 3 || res.selection === undefined) return; // Close
         const st = loadStats(player);
-        if (res.selection === 3) return; // Close
         if (st.points <= 0) {
-            player.sendMessage("§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
+            tell(player, "§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
             safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
             return;
         }
         const key = res.selection === 0 ? "str" : res.selection === 1 ? "dur" : "agi";
         const names = { str: "Strength", dur: "Durability", agi: "Agility" };
         if (st[key] >= MAX_STAT) {
-            player.sendMessage(`§b[SYSTEM] §7${names[key]} is maxed (${MAX_STAT}).`);
+            tell(player, `§b[SYSTEM] §7${names[key]} is maxed (${MAX_STAT}).`);
             return;
         }
         st[key] += 1;
         st.points -= 1;
         saveStats(player, st);
         if (key === "dur") applyDurability(player, HP_PER_DUR);
+        if (key === "agi") {
+            try { player.addEffect("speed", 200, { amplifier: agiAmplifier(st.agi), showParticles: false }); } catch { /* ignore */ }
+        }
         // Spend FX: pitch climbs with the new value, spark burst, action bar flash.
         safeSound(player, "random.orb", { pitch: 0.7 + Math.min(st[key], 25) * 0.03, volume: 0.8 });
         ringBurst(player, 4);
         setActionBar(player, `§e${names[key]} §7→ §f${st[key]}`);
-        player.sendMessage(`§b[SYSTEM] §f${names[key]} §7→ §f${st[key]} §8(${st.points} points left)`);
-        system.runTimeout(() => openSystem(player, 0), 5);
+        tell(player, `§b[SYSTEM] §f${names[key]} §7→ §f${st[key]} §8(${st.points} points left)`);
+        try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
+        // Re-open so points can be spent in a row. 10 ticks: reopening too fast
+        // lands while the old form is still closing and comes back UserBusy.
+        system.runTimeout(() => openSystem(player, 1), 10);
     }).catch(() => { /* player offline / in another UI */ });
 }
 
@@ -366,61 +449,132 @@ function openSystemAnimated(player, retry = 1) {
 }
 
 // ---- Gesture: sneaking + 2 jumps ----
-const gesture = new Map(); // playerId -> { jumps, windowStart, lastVy, cooldownUntil }
+const gesture = new Map(); // playerId -> gesture state
 
+function gestureState(player) {
+    let g = gesture.get(player.id);
+    if (!g) {
+        g = {
+            jumps: 0,
+            windowStart: 0,
+            lastVy: 0,
+            cooldownUntil: 0,
+            wasSneaking: false,
+            wasOnGround: true,
+            lastJumpTick: -1000,
+            lastSneakTick: -1000,
+            airJumpTick: -1000,
+        };
+        gesture.set(player.id, g);
+    }
+    return g;
+}
+
+// Single funnel for every jump source (button event + velocity sampling), so a
+// jump seen twice still only counts once.
+function registerJump(player, now) {
+    try {
+        const g = gestureState(player);
+        if (now - g.lastJumpTick < JUMP_DEBOUNCE) return;
+        g.lastJumpTick = now;
+        g.airJumpTick = now;
+        let sneaking = false;
+        try { sneaking = player.isSneaking === true; } catch { /* ignore */ }
+        if (sneaking) g.lastSneakTick = now;
+        // Jumping out of a crouch drops isSneaking for a few ticks even though the
+        // player is still holding the button, so a strict `isSneaking` test threw
+        // away the second jump of the gesture. The grace only *continues* a gesture
+        // that a real crouched jump started — it can never start one, so releasing
+        // sneak and then double-jumping does nothing.
+        if (!sneaking) {
+            const continuing = g.jumps > 0 && now - g.lastSneakTick <= SNEAK_GRACE;
+            if (!continuing) { g.jumps = 0; return; }
+        }
+        if (now < g.cooldownUntil) { g.jumps = 0; return; }
+        if (g.jumps === 0 || now - g.windowStart > GESTURE_WINDOW) {
+            g.jumps = 1;
+            g.windowStart = now;
+        } else {
+            g.jumps += 1;
+        }
+        if (g.jumps >= 2) {
+            g.jumps = 0;
+            g.cooldownUntil = now + UI_COOLDOWN;
+            openSystemAnimated(player);
+        }
+    } catch { /* player mid-teleport */ }
+}
+
+// Dismiss = the reverse of open: jump first, then sneak mid-air.
+function registerSneakStart(player, now, airborne) {
+    try {
+        const g = gestureState(player);
+        if (!airborne) return;
+        if (now - g.airJumpTick > DISMISS_WINDOW) return;
+        dismissHologram(player);
+    } catch { /* ignore */ }
+}
+
+// Preferred input source: exact button presses, unaffected by tick sampling.
+// Stable in @minecraft/server 2.0.0; guarded so an older engine still loads.
+try {
+    world.afterEvents.playerButtonInput?.subscribe((ev) => {
+        try {
+            if (ev.newButtonState !== "Pressed") return;
+            const now = system.currentTick;
+            if (ev.button === "Jump") {
+                registerJump(ev.player, now);
+            } else if (ev.button === "Sneak") {
+                let airborne = false;
+                try { airborne = !ev.player.isOnGround; } catch { /* ignore */ }
+                registerSneakStart(ev.player, now, airborne);
+            }
+        } catch { /* ignore */ }
+    });
+} catch { /* event unavailable on this version */ }
+
+// Fallback input source, every tick. The old 2-tick loop with a `vy > 0.35`
+// threshold missed most jumps outright: jump velocity decays below 0.35 within
+// one tick, so a sample taken on the wrong tick never saw a jump at all.
 system.runInterval(() => {
     const now = system.currentTick;
     for (const player of world.getPlayers()) {
         try {
             if (!player.isValid) continue;
-            let g = gesture.get(player.id);
-            if (!g) {
-                g = { jumps: 0, windowStart: 0, lastVy: 0, cooldownUntil: 0, wasSneaking: false, airJumpTick: -1000 };
-                gesture.set(player.id, g);
-            }
+            const g = gestureState(player);
+
             let vy = 0;
             try { vy = player.getVelocity()?.y ?? 0; } catch { vy = 0; }
-            const rising = g.lastVy <= 0.3 && vy > 0.35;
-            g.lastVy = vy;
+            let onGround = true;
+            try { onGround = player.isOnGround; } catch { onGround = true; }
+            let sneaking = false;
+            try { sneaking = player.isSneaking === true; } catch { sneaking = false; }
 
-            const sneaking = player.isSneaking;
-            if (rising && !sneaking) g.airJumpTick = now;
-            // Dismiss = the reverse of open: jump first, then sneak mid-air.
-            // |vy| check keeps it mid-air only, so landing-then-sneaking won't banish.
-            if (sneaking && !g.wasSneaking && now - g.airJumpTick < 40 && Math.abs(vy) > 0.05) {
-                dismissHologram(player);
-            }
+            // Left the ground moving up, or a clean upward spike while airborne.
+            const leftGround = g.wasOnGround && !onGround && vy > 0.05;
+            const spike = !g.wasOnGround && g.lastVy <= 0.2 && vy > 0.35;
+            if (leftGround || spike) registerJump(player, now);
+
+            if (sneaking) g.lastSneakTick = now;
+            if (sneaking && !g.wasSneaking) registerSneakStart(player, now, !onGround);
+
+            g.lastVy = vy;
+            g.wasOnGround = onGround;
             g.wasSneaking = sneaking;
 
-            if (!player.isSneaking) {
-                // Window expired while not sneaking: drop stale progress.
-                if (g.jumps > 0 && now - g.windowStart > XP_WINDOW_NOTE) g.jumps = 0;
-                continue;
-            }
-            if (now < g.cooldownUntil) { g.jumps = 0; continue; }
-            if (rising) {
-                if (g.jumps === 0 || now - g.windowStart > XP_WINDOW_NOTE) {
-                    g.jumps = 1;
-                    g.windowStart = now;
-                } else {
-                    g.jumps += 1;
-                }
-                if (g.jumps >= 2) {
-                    g.jumps = 0;
-                    g.cooldownUntil = now + UI_COOLDOWN;
-                    openSystemAnimated(player);
-                }
-            } else if (g.jumps > 0 && now - g.windowStart > XP_WINDOW_NOTE) {
-                g.jumps = 0;
-            }
+            // Drop stale progress once the window has passed.
+            if (g.jumps > 0 && now - g.windowStart > GESTURE_WINDOW) g.jumps = 0;
         } catch { /* skip players mid-teleport */ }
     }
-    // Prune players who left.
-    if (gesture.size > 60) {
-        const online = new Set(world.getPlayers().map((p) => p.id));
-        for (const id of gesture.keys()) if (!online.has(id)) gesture.delete(id);
-    }
-}, 2);
+}, 1);
+
+// Gesture state is per-player; drop it when they leave instead of letting the
+// map grow until it happens to pass an arbitrary size threshold.
+try {
+    world.afterEvents.playerLeave.subscribe((ev) => {
+        gesture.delete(ev.playerId);
+    });
+} catch { /* ignore */ }
 
 // ---- XP from kills -> level ups -> stat points ----
 world.afterEvents.entityDie.subscribe((ev) => {
@@ -445,7 +599,7 @@ world.afterEvents.entityDie.subscribe((ev) => {
         saveStats(killer, s);
         if (ups > 0) {
             levelUpCinematic(killer, s.level, ups * POINTS_PER_LEVEL);
-            killer.sendMessage(`§b[SYSTEM] §7Level §f${s.level}§7! Sneak + double-jump to open your status.`);
+            tell(killer, `§b[SYSTEM] §7Level §f${s.level}§7! Sneak + double-jump to open your status.`);
         } else {
             // Kill feedback: XP blip on the action bar + orb sound.
             setActionBar(killer, `§b+${gain} XP §8(${s.xp}/${xpNext(s.level)})`);
@@ -455,27 +609,43 @@ world.afterEvents.entityDie.subscribe((ev) => {
 });
 
 // ---- STR: bonus damage on melee hits (with crit spark) ----
-const bonusHitAt = new Map(); // victimId -> tick of last bonus damage (anti-recursion)
+// This used to hang off entityHitEntity and call applyDamage(bonus). That never
+// dealt anything: the victim is inside its post-hit invulnerability window, and
+// damage arriving during i-frames is ignored unless it is LARGER than the hit
+// that started them — in which case only the difference lands. So the fix is to
+// re-apply (originalDamage + bonus): the engine subtracts the damage already
+// taken and the net result is exactly the STR bonus, still credited to the
+// player so kills award XP. entityHurt is used because it reports the real,
+// post-armor damage number that the i-frame window is holding.
+const bonusHitAt = new Map(); // "victim|hitter" -> tick of last bonus damage (anti-recursion)
 
-world.afterEvents.entityHitEntity.subscribe((ev) => {
+world.afterEvents.entityHurt.subscribe((ev) => {
     try {
-        const hitter = ev.damagingEntity;
+        const source = ev.damageSource;
+        if (!source || source.cause !== EntityDamageCause.entityAttack) return;
+        if (source.damagingProjectile) return; // melee only
+        const hitter = source.damagingEntity;
         if (!hitter || hitter.typeId !== "minecraft:player") return;
+        const target = ev.hurtEntity;
+        if (!target || !target.isValid || target.id === hitter.id) return;
         const bonus = num(hitter.getDynamicProperty("lu_str")) * STR_DMG_PER_POINT;
         if (bonus <= 0) return;
-        const target = ev.hitEntity;
-        if (!target || !target.isValid) return;
+        const dealt = ev.damage;
+        if (!Number.isFinite(dealt) || dealt <= 0) return;
+
+        const now = system.currentTick;
+        const key = `${target.id}|${hitter.id}`;
+        // Our own applyDamage re-fires this event; never let the bonus compound.
+        if (now - (bonusHitAt.get(key) ?? -100) < 5) return;
+        bonusHitAt.set(key, now);
+        if (bonusHitAt.size > 200) {
+            for (const [k, t] of bonusHitAt) if (now - t > 20) bonusHitAt.delete(k);
+        }
+
         system.run(() => {
             try {
                 if (!target.isValid) return;
-                const now = system.currentTick;
-                // Guard: if applyDamage ever re-fires this event, never stack with our own bonus.
-                if (now - (bonusHitAt.get(target.id) ?? -100) < 5) return;
-                bonusHitAt.set(target.id, now);
-                if (bonusHitAt.size > 200) {
-                    for (const [id, t] of bonusHitAt) if (now - t > 20) bonusHitAt.delete(id);
-                }
-                target.applyDamage(bonus, { damagingEntity: hitter });
+                target.applyDamage(dealt + bonus, { cause: EntityDamageCause.entityAttack, damagingEntity: hitter });
                 try {
                     burstAt(target.dimension, target.location, "hit",
                         ["minecraft:critical_hit_emitter", "minecraft:mobspell_emitter"], 3, 0.4);
@@ -492,7 +662,7 @@ world.afterEvents.playerSpawn.subscribe((ev) => {
     }, 10);
 });
 
-// ---- AGI speed refresh + DUR fallback upkeep + high-level idle aura ----
+// ---- AGI speed refresh + DUR upkeep + high-level idle aura ----
 system.runInterval(() => {
     for (const player of world.getPlayers()) {
         try {
@@ -500,11 +670,12 @@ system.runInterval(() => {
             const agi = num(player.getDynamicProperty("lu_agi"));
             if (agi > 0) {
                 try {
-                    player.addEffect("speed", 140, { amplifier: agiAmplifier(agi), showParticles: false });
+                    // 200 ticks > the 100-tick refresh, so the effect never blinks out.
+                    player.addEffect("speed", 200, { amplifier: agiAmplifier(agi), showParticles: false });
                 } catch { /* effect unavailable */ }
             }
-            // If direct max-HP writes are unsupported, re-apply DUR via health_boost here.
-            if (maxHpWritable === false) applyDurability(player);
+            // Keep the health_boost fallback alive (and grant it the first time round).
+            if (maxHpWritable !== true) applyDurability(player);
             const level = num(player.getDynamicProperty("lu_level"), 1);
             if (level >= AURA_MIN_LEVEL) {
                 try {
@@ -517,19 +688,43 @@ system.runInterval(() => {
     }
 }, 100);
 
-// ---- Chat fallback (mobile-friendly): "stats" / "system" ----
-world.beforeEvents.chatSend.subscribe((ev) => {
-    const msg = (ev.message ?? "").trim().toLowerCase();
-    if (msg === "stats" || msg === ".stats" || msg === "system" || msg === ".system" || msg === "status") {
-        ev.cancel = true;
-        system.run(() => {
-            try {
-                const g = gesture.get(ev.sender.id);
-                if (g) g.cooldownUntil = system.currentTick + UI_COOLDOWN;
-                openSystemAnimated(ev.sender);
-            } catch { /* ignore */ }
+// ---- Fallbacks for opening the SYSTEM without the gesture ----
+function openFromCommand(player) {
+    try {
+        if (!player?.isValid) return;
+        const g = gestureState(player);
+        g.cooldownUntil = system.currentTick + UI_COOLDOWN;
+        openSystemAnimated(player);
+    } catch { /* ignore */ }
+}
+
+// `/scriptevent lu:stats` — always available, works on every platform.
+try {
+    system.afterEvents.scriptEventReceive.subscribe((ev) => {
+        if (ev.id !== "lu:stats" && ev.id !== "lu:system") return;
+        const player = ev.sourceEntity;
+        if (!player || player.typeId !== "minecraft:player") return;
+        openFromCommand(player);
+    }, { namespaces: ["lu"] });
+} catch { /* ignore */ }
+
+// Chat fallback ("stats" / "system"). chatSend is NOT part of stable
+// @minecraft/server 2.0.0 — reading `.subscribe` off it used to throw a
+// TypeError at the top level of this module, which aborted the whole script
+// and silently disabled the entire addon. Guarded, so it is now a bonus on
+// engines/betas that do expose it.
+try {
+    const chatSend = world.beforeEvents?.["chatSend"];
+    if (chatSend && typeof chatSend.subscribe === "function") {
+        chatSend.subscribe((ev) => {
+            const msg = (ev.message ?? "").trim().toLowerCase();
+            if (msg === "stats" || msg === ".stats" || msg === "system" || msg === ".system" || msg === "status") {
+                ev.cancel = true;
+                const sender = ev.sender;
+                system.run(() => openFromCommand(sender));
+            }
         });
     }
-});
+} catch { /* chat events unavailable */ }
 
-console.warn("[LevelUp] loaded: sneak + double-jump opens the SYSTEM.");
+console.warn("[LevelUp] loaded: sneak + double-jump opens the SYSTEM (or /scriptevent lu:stats).");
