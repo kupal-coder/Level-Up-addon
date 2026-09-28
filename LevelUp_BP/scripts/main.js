@@ -11,10 +11,12 @@ const JUMP_DEBOUNCE = 6; // ticks; one physical jump must only ever count once
 const SNEAK_GRACE = 12; // ticks a crouch still counts after jumping breaks it
 const UI_COOLDOWN = 60; // ticks after opening before gesture works again
 const MAX_STAT = 50;
-// agiAmplifier saturates at Speed V, so an Agility point past 20 changes nothing at
-// all. Without this the form happily swallowed 30 of a player's 50 points for no
-// effect whatsoever, and the tier line read "Speed 5" before and after.
-const AGI_CAP = 20;
+// Speed has exactly five tiers, and every point has to buy one. An earlier model
+// used `floor(agi / 5)`, which made 4 of every 5 Agility points a no-op (only
+// agi 1/5/10/15/20 changed anything) and let the form sell the rest for nothing
+// while still printing "Speed 5". One point per tier removes the banding; the
+// price is a cap of 5 instead of 20.
+const AGI_CAP = 5;
 const AURA_MIN_LEVEL = 5; // level at which players get an idle wisp aura
 
 const xpNext = (level) => level * 50;
@@ -54,6 +56,15 @@ function saveStats(player, s) {
 // Strength and Durability scale all the way to MAX_STAT.
 function statCap(key) {
     return key === "agi" ? AGI_CAP : MAX_STAT;
+}
+
+// Is there anywhere left to put a point? A re-open is only worth it if the player
+// has an unspent point AND a stat that will take it. When everything is capped
+// there is nothing to strand, and re-opening anyway traps them: every tap just
+// re-opened the form, so Close was the only way out.
+function anySpendable(s) {
+    return s.points > 0 &&
+        (s.str < statCap("str") || s.dur < statCap("dur") || s.agi < statCap("agi"));
 }
 
 // ---- DUR -> max HP ----
@@ -160,8 +171,9 @@ function applyDurability(player, heal = 0) {
     } catch { /* player left mid-tick */ }
 }
 
+// One Agility point == one Speed tier, so no purchase is ever a no-op.
 function agiAmplifier(agi) {
-    return Math.min(4, Math.floor(agi / 5));
+    return Math.max(0, Math.min(4, agi - 1));
 }
 
 // Single place that (re)grants the AGI speed effect, so joining/respawning and the
@@ -502,9 +514,10 @@ function openSystem(player, retry = 1) {
         if (st[key] >= statCap(key)) {
             tell(player, `§b[SYSTEM] §7${names[key]} is maxed (${statCap(key)}).`);
             safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
-            // Re-open anyway: the points are still theirs to spend on another stat, and
-            // returning here without a form strands them until they redo the gesture.
-            system.runTimeout(() => openSystem(player, 1), 10);
+            // Re-open only if the points are still theirs to spend somewhere else.
+            // Returning here without a form would strand them, but re-opening when
+            // nothing is spendable just traps them in a form they cannot tap out of.
+            if (anySpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
             return;
         }
         st[key] += 1;

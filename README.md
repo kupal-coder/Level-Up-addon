@@ -17,12 +17,13 @@ Solo-leveling style stats system for Minecraft Bedrock.
 |---|---|---|
 | ⚔ Strength | +0.5 melee damage per point | 50 |
 | ❤ Durability | max HP, granted in 4 HP steps (see note) | 50 |
-| ➶ Agility | Speed effect tier grows every 5 points — **stops at Speed V (20)** | 20 |
+| ➶ Agility | +1 Speed tier per point — Speed I to Speed V | 5 |
 
 Killing mobs grants XP (stronger mobs = more XP). Each level-up gives **3 stat points**.
 
-> Agility is capped at 20 because Speed V is the highest tier the effect has: past that a point
-> would change nothing, and the window will not sell you one.
+> Agility is capped at 5 because Speed only has five tiers. An earlier build scored Agility as
+> "a tier every 5 points", which meant 4 of every 5 points bought nothing at all while the window
+> still read "Speed 5" — so every point now buys exactly one tier.
 
 > Max HP can't be written directly by the Script API, so Durability is granted with a
 > maintained `health_boost` effect, which only moves in **4 HP steps**. Odd Durability values

@@ -18,6 +18,9 @@ async function advanceAsync(n) { for (let i = 0; i < n; i++) { advance(1); await
 
 const P = harness.Player;
 function newPlayer(name) { const p = new P(name); harness.players.push(p); return p; }
+// formLog.shown is global, so a re-open chain left running by an earlier test
+// would otherwise be counted against whoever we are asserting on.
+const formsFor = (p) => formLog.shown.filter((s) => s.player === p.id).length;
 
 await import("../LevelUp_BP/scripts/main.js");
 
@@ -43,7 +46,7 @@ await t("sneak + double jump opens the SYSTEM form", () => {
     p.isSneaking = true;
     jump(p); jump(p);
     advance(15);
-    assert.ok(formLog.shown.length >= 1, "form never shown");
+    assert.ok(formsFor(p) >= 1, "form never shown");
 });
 
 await t("a single jump does NOT open the form", () => {
@@ -52,7 +55,7 @@ await t("a single jump does NOT open the form", () => {
     p.isSneaking = true;
     jump(p);
     advance(80);
-    assert.strictEqual(formLog.shown.length, 0);
+    assert.strictEqual(formsFor(p), 0);
 });
 
 await t("double jump while NOT sneaking does not open", () => {
@@ -61,7 +64,7 @@ await t("double jump while NOT sneaking does not open", () => {
     p.isSneaking = false;
     jump(p); jump(p);
     advance(30);
-    assert.strictEqual(formLog.shown.length, 0);
+    assert.strictEqual(formsFor(p), 0);
 });
 
 // --- 3. button-input path also works ---
@@ -74,7 +77,7 @@ await t("playerButtonInput jump presses open the form", () => {
     advance(8);
     world.afterEvents.playerButtonInput.emit({ player: q, button: "Jump", newButtonState: "Pressed" });
     advance(15);
-    assert.ok(formLog.shown.length >= 1, "form never shown via button input");
+    assert.ok(formsFor(q) >= 1, "form never shown via button input");
 });
 
 // --- 4. XP / level up ---
@@ -256,25 +259,49 @@ await t("maxing a stat reopens the form so the remaining points stay spendable",
     formLog.shown.length = 0;
     system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sp });
     await advanceAsync(30);
-    assert.ok(formLog.shown.length >= 2,
+    assert.ok(formsFor(sp) >= 2,
         "form closed on a maxed stat, stranding " + sp.getDynamicProperty("lu_points") + " points");
     assert.strictEqual(sp.getDynamicProperty("lu_points"), 5, "a point was spent on a maxed stat");
     formLog.respond = null;
 });
 
-// --- 9c. Agility saturates long before MAX_STAT ---
-// agiAmplifier is min(4, floor(agi/5)), so anything past AGI 20 bought literally
-// nothing while the form still showed "Speed 5" and cheerfully took the point.
+// --- 9c. every stat point must buy something ---
+// The first Agility model used floor(agi/5): only agi 1/5/10/15/20 changed the
+// Speed tier, so 4 of every 5 points were sold for nothing while the form still
+// read "Speed 5". One point per tier, capped at 5, is the only model where a
+// point is never a no-op.
+await t("every Agility point buys a distinct Speed tier", async () => {
+    advance(120);
+    const seen = [];
+    for (let want = 1; want <= 5; want++) {
+        const ag = newPlayer("tier" + want);
+        ag.setDynamicProperty("lu_agi", want - 1);
+        ag.setDynamicProperty("lu_points", 2);
+        formLog.respond = () => ({ canceled: false, selection: 2 });
+        system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: ag });
+        await advanceAsync(12);
+        assert.strictEqual(ag.getDynamicProperty("lu_agi"), want, "agi did not reach " + want);
+        assert.strictEqual(ag.getDynamicProperty("lu_points"), 1, "the point was not spent");
+        assert.strictEqual(ag.getEffect("speed").amplifier, want - 1,
+            "agi " + want + " should be Speed " + want);
+        seen.push(ag.getEffect("speed").amplifier);
+        formLog.respond = null;
+        ag.isValid = false;
+        harness.players = harness.players.filter((x) => x !== ag);
+    }
+    assert.strictEqual(new Set(seen).size, 5, "some Agility points gave the same tier");
+});
+
 await t("Agility points past the cap cannot be spent", async () => {
     advance(120);
     const ag = newPlayer("vera");
-    ag.setDynamicProperty("lu_agi", 20); // Speed V: the last value that changes anything
+    ag.setDynamicProperty("lu_agi", 5); // Speed V: the last tier
     ag.setDynamicProperty("lu_points", 5);
     formLog.respond = () => ({ canceled: false, selection: 2 }); // keep tapping Agility
     formLog.shown.length = 0;
     system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: ag });
-    await advanceAsync(30);
-    assert.strictEqual(ag.getDynamicProperty("lu_agi"), 20, "agi was raised past its cap");
+    await advanceAsync(12);
+    assert.strictEqual(ag.getDynamicProperty("lu_agi"), 5, "agi was raised past its cap");
     assert.strictEqual(ag.getDynamicProperty("lu_points"), 5, "a point was burned on a no-op Agility purchase");
     formLog.respond = null;
 });
@@ -282,12 +309,12 @@ await t("Agility points past the cap cannot be spent", async () => {
 await t("Agility below the cap still spends normally", async () => {
     advance(120);
     const ag = newPlayer("wade");
-    ag.setDynamicProperty("lu_agi", 19);
+    ag.setDynamicProperty("lu_agi", 2);
     ag.setDynamicProperty("lu_points", 5);
     formLog.respond = () => ({ canceled: false, selection: 2 });
     system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: ag });
-    await advanceAsync(30);
-    assert.strictEqual(ag.getDynamicProperty("lu_agi"), 20, "agi did not reach its cap");
+    await advanceAsync(12);
+    assert.strictEqual(ag.getDynamicProperty("lu_agi"), 3, "agi did not step one tier");
     assert.strictEqual(ag.getDynamicProperty("lu_points"), 4, "the point was not spent");
     formLog.respond = null;
 });
@@ -315,6 +342,43 @@ await t("upkeep never removes a health_boost from another source", async () => {
     assert.strictEqual(hb.getComponent("health").effectiveMax, 40, "foreign max HP was lost");
 });
 
+// --- 9e. a maxed tap must not trap the player in the form ---
+// Re-opening on a maxed stat was v1.3.3's fix for stranded points, but with every
+// stat capped there is nowhere to strand them to: each tap just re-opened the form,
+// so Close was the only exit.
+await t("tapping a maxed stat does not re-open when nothing is spendable", async () => {
+    advance(120);
+    const sp = newPlayer("trapper");
+    sp.setDynamicProperty("lu_points", 5);
+    sp.setDynamicProperty("lu_str", 50);
+    sp.setDynamicProperty("lu_dur", 50);
+    sp.setDynamicProperty("lu_agi", 5);
+    formLog.shown.length = 0;
+    formLog.respond = () => ({ canceled: false, selection: 0 }); // keeps tapping STR
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sp });
+    await advanceAsync(300);
+    assert.strictEqual(formsFor(sp), 1,
+        "form re-opened " + formsFor(sp) + " times with nothing spendable");
+    assert.strictEqual(sp.getDynamicProperty("lu_points"), 5, "a point was spent on a maxed stat");
+    formLog.respond = null;
+});
+
+await t("tapping a maxed stat still reopens when another stat can take the point", async () => {
+    advance(120);
+    const sp = newPlayer("untrapped");
+    sp.setDynamicProperty("lu_points", 5);
+    sp.setDynamicProperty("lu_str", 50);
+    sp.setDynamicProperty("lu_dur", 3);
+    formLog.shown.length = 0;
+    formLog.respond = () => ({ canceled: false, selection: 0 });
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sp });
+    await advanceAsync(60);
+    assert.ok(formsFor(sp) >= 2,
+        "form closed on a maxed stat, stranding " + sp.getDynamicProperty("lu_points") + " points");
+    assert.strictEqual(sp.getDynamicProperty("lu_points"), 5, "a point was spent on a maxed stat");
+    formLog.respond = null;
+});
+
 await t("Close button does not spend a point", async () => {
     advance(120);
     const sp = newPlayer("mia");
@@ -334,7 +398,7 @@ await t("/scriptevent lu:stats opens the SYSTEM", () => {
     const z = newPlayer("nora");
     system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
     advance(15);
-    assert.ok(formLog.shown.length >= 1, "scriptevent did not open the form");
+    assert.ok(formsFor(z) >= 1, "scriptevent did not open the form");
 });
 
 // --- 11. leak checks ---
