@@ -162,6 +162,40 @@ await t("DUR 0 does not leave a stale health_boost", () => {
     assert.ok(!d.getEffect("health_boost"), "stale boost not cleared");
 });
 
+// --- 6b. DUR hearts survive death ---
+// Dying clears every effect, so a respawn revives the player at their no-boost
+// max and the hearts Durability grants above it start empty. Without a refill the
+// death penalty scaled with Durability (DUR 50 revived at 20/120).
+await t("a full-health spawn refills the hearts Durability grants", () => {
+    const d = newPlayer("rene");
+    d.setDynamicProperty("lu_dur", 6); // +12 HP -> 32 max
+    // Align just after an upkeep pass, so the next one is ~100 ticks out and the
+    // only thing that can run inside the spawn window is the playerSpawn handler.
+    for (let i = 0; i < 100 && !d.getEffect("health_boost"); i++) advance(1);
+    assert.ok(d.getEffect("health_boost"), "precondition: boost was granted");
+    // Death: effects cleared, revived at full no-boost health.
+    d.removeEffect("health_boost");
+    d.getComponent("health").setCurrentValue(20);
+    world.afterEvents.playerSpawn.emit({ player: d });
+    advance(15);
+    const hp = d.getComponent("health");
+    assert.strictEqual(hp.effectiveMax, 32, "precondition: boost re-applied on spawn");
+    assert.strictEqual(hp.currentValue, 32,
+        "respawned at " + hp.currentValue + "/32 — the DUR hearts were left empty");
+});
+
+await t("a damaged spawn keeps its exact HP (a relog must not heal)", () => {
+    const d = newPlayer("saul");
+    d.setDynamicProperty("lu_dur", 6);
+    d.getComponent("health").setCurrentValue(17); // genuinely damaged, below the no-boost max
+    world.afterEvents.playerSpawn.emit({ player: d });
+    advance(15);
+    const hp = d.getComponent("health");
+    assert.strictEqual(hp.effectiveMax, 32, "boost was not re-applied on spawn");
+    assert.strictEqual(hp.currentValue, 17,
+        "a damaged player was healed for free to " + hp.currentValue);
+});
+
 // --- 7. AGI speed does not blink out between refreshes ---
 await t("AGI speed effect is always present between refreshes", () => {
     const a = newPlayer("jack");
