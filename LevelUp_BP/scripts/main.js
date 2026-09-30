@@ -91,7 +91,10 @@ function healthBoostAmplifier(dur) {
 function maxHpOf(player, s) {
     try {
         const v = player.getComponent("health")?.effectiveMax;
-        if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.round(v);
+        if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+            const ideal = 20 + s.dur * HP_PER_DUR;
+            return v >= ideal ? Math.round(v) : ideal;
+        }
     } catch { /* unreadable */ }
     return 20 + s.dur * HP_PER_DUR;
 }
@@ -146,11 +149,16 @@ function applyDurability(player, heal = 0) {
         }
 
         if (maxHpWritable === true) {
-            try { hp.effectiveMax = want; } catch { maxHpWritable = false; }
-            if (maxHpWritable === true) {
-                healUpTo(hp, heal, want);
-                return;
-            }
+            try {
+                const cur = player.getEffect("health_boost");
+                if (cur !== undefined && cur.amplifier > healthBoostAmplifier(s.dur)) {
+                    // External boost is stronger — don't overwrite it
+                } else {
+                    hp.effectiveMax = want;
+                    healUpTo(hp, heal, want);
+                    return;
+                }
+            } catch { maxHpWritable = false; }
         }
 
         // Fallback: health_boost, refreshed by the 100-tick upkeep loop below.
@@ -739,9 +747,7 @@ world.afterEvents.entityHurt.subscribe((ev) => {
         // Our own applyDamage re-fires this event; never let the bonus compound.
         if (now - (bonusHitAt.get(key) ?? -100) < 5) return;
         bonusHitAt.set(key, now);
-        if (bonusHitAt.size > 200) {
-            for (const [k, t] of bonusHitAt) if (now - t > 20) bonusHitAt.delete(k);
-        }
+        for (const [k, t] of bonusHitAt) if (now - t > 20) bonusHitAt.delete(k);
 
         system.run(() => {
             try {
@@ -762,7 +768,11 @@ world.afterEvents.playerSpawn.subscribe((ev) => {
         try {
             // AGI too: without this the upkeep loop was the only thing granting speed,
             // so a respawn left the player walking at base speed for up to 5s.
-            if (ev.player.isValid) { applyAgility(ev.player); applyDurability(ev.player); }
+            if (ev.player.isValid) {
+                applyAgility(ev.player);
+                const s = loadStats(ev.player);
+                applyDurability(ev.player, s.dur * HP_PER_DUR);
+            }
         } catch { /* ignore */ }
     }, 10);
 });
