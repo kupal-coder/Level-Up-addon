@@ -29,6 +29,10 @@ Killing mobs grants XP (stronger mobs = more XP). Each level-up gives **3 stat p
 > maintained `health_boost` effect, which only moves in **4 HP steps**. Odd Durability values
 > therefore round *up* (1 Durability = 24 max HP, not 22); even values land exactly on
 > `+2 HP per point`. The SYSTEM window always shows the real number, never the ideal one.
+>
+> Dying clears that effect like any other, so on respawn the SYSTEM refills your Durability
+> hearts — you always revive at your full max HP, whatever your Durability. A player who was
+> already hurt keeps their exact health: relogging is never a free heal.
 
 ## Cinematic touches
 

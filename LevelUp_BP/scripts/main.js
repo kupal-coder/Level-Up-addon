@@ -762,7 +762,34 @@ world.afterEvents.playerSpawn.subscribe((ev) => {
         try {
             // AGI too: without this the upkeep loop was the only thing granting speed,
             // so a respawn left the player walking at base speed for up to 5s.
-            if (ev.player.isValid) { applyAgility(ev.player); applyDurability(ev.player); }
+            if (!ev.player.isValid) return;
+            applyAgility(ev.player);
+            // Dying clears every effect, so a respawn revives the player at their
+            // no-boost max (20) and every heart Durability grants above that starts
+            // empty — the higher the Durability, the emptier the revive (DUR 50 came
+            // back at 20/120 and no upkeep pass ever healed it, because they only
+            // maintain the boost). A relog whose boost was clamped away loses the
+            // same hearts. Refill them, but only for a player who was at full health
+            // *before* the boost was (re)applied: "full before -> full after". Someone
+            // who was genuinely damaged keeps their exact HP, so a relog is never a
+            // free heal and this stays a stat top-up, not a fountain.
+            let wasFull = false;
+            try {
+                const hp = ev.player.getComponent("health");
+                const max = hp?.effectiveMax;
+                const cur = hp?.currentValue;
+                if (typeof max === "number" && max > 0 && typeof cur === "number") {
+                    wasFull = cur >= max - 0.001;
+                }
+            } catch { /* ignore */ }
+            applyDurability(ev.player);
+            if (wasFull) {
+                try {
+                    const hp = ev.player.getComponent("health");
+                    const cap = hp?.effectiveMax;
+                    if (hp && typeof cap === "number" && cap > 0) healUpTo(hp, cap, cap);
+                } catch { /* ignore */ }
+            }
         } catch { /* ignore */ }
     }, 10);
 });
