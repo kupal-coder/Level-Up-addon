@@ -16,7 +16,7 @@ Solo-leveling style stats system for Minecraft Bedrock.
 | Attribute | Effect | Cap |
 |---|---|---|
 | ⚔ Strength | +0.5 melee damage per point | 50 |
-| ❤ Durability | max HP, granted in 4 HP steps (see note) | 50 |
+| ❤ Durability | +4 max HP per point (1 step of `health_boost`) | 25 |
 | ➶ Agility | +1 Speed tier per point — Speed I to Speed V | 5 |
 
 Killing mobs grants XP (stronger mobs = more XP). Each level-up gives **3 stat points**.
@@ -26,9 +26,10 @@ Killing mobs grants XP (stronger mobs = more XP). Each level-up gives **3 stat p
 > still read "Speed 5" — so every point now buys exactly one tier.
 
 > Max HP can't be written directly by the Script API, so Durability is granted with a
-> maintained `health_boost` effect, which only moves in **4 HP steps**. Odd Durability values
-> therefore round *up* (1 Durability = 24 max HP, not 22); even values land exactly on
-> `+2 HP per point`. The SYSTEM window always shows the real number, never the ideal one.
+> maintained `health_boost` effect, which only moves in **4 HP steps**. Each Durability
+> point therefore buys exactly one step (+4 max HP, up to 120 at DUR 25), so no point
+> is ever a no-op. The SYSTEM window shows the real number (foreign `health_boost`
+> effects from `/effect` or another addon are ignored in the display).
 
 ## Cinematic touches
 
@@ -51,4 +52,4 @@ Killing mobs grants XP (stronger mobs = more XP). Each level-up gives **3 stat p
 
 ## Tuning
 
-All balance numbers live at the top of `LevelUp_BP/scripts/main.js` (`POINTS_PER_LEVEL`, `STR_DMG_PER_POINT`, `HP_PER_DUR`, `MAX_STAT`).
+All balance numbers live at the top of `LevelUp_BP/scripts/main.js` (`POINTS_PER_LEVEL`, `STR_DMG_PER_POINT`, `HP_PER_DUR`, `MAX_STAT`, `DUR_CAP`, `AGI_CAP`).

@@ -134,7 +134,7 @@ await t("zero STR applies no bonus damage", () => {
 // --- 6. DUR -> max HP via health_boost fallback ---
 await t("DUR grants max HP through health_boost when effectiveMax is read-only", () => {
     const d = newPlayer("gina");
-    d.setDynamicProperty("lu_dur", 4); // want 28 max HP
+    d.setDynamicProperty("lu_dur", 4); // want 36 max HP (4 HP per point)
     world.afterEvents.playerSpawn.emit({ player: d });
     advance(20);
     const hp = d.getComponent("health");
@@ -162,10 +162,26 @@ await t("DUR 0 does not leave a stale health_boost", () => {
     assert.ok(!d.getEffect("health_boost"), "stale boost not cleared");
 });
 
+// Every DUR point must buy Max HP. The old HP_PER_DUR=2 quantized pairs to the
+// same 4-HP step (1-2 -> 24, 3-4 -> 28), so every even point was a no-op.
+// HP_PER_DUR=4 makes each point exactly one step.
+await t("every Durability point buys distinct max HP", () => {
+    for (let want = 1; want <= 5; want++) {
+        const d = newPlayer("dur" + want);
+        d.setDynamicProperty("lu_dur", want);
+        world.afterEvents.playerSpawn.emit({ player: d });
+        advance(20);
+        assert.strictEqual(d.getComponent("health").effectiveMax, 20 + want * 4,
+            "dur " + want + " should be " + (20 + want * 4) + " max HP");
+        d.isValid = false;
+        harness.players = harness.players.filter((x) => x !== d);
+    }
+});
+
 // --- 7. AGI speed does not blink out between refreshes ---
 await t("AGI speed effect is always present between refreshes", () => {
     const a = newPlayer("jack");
-    a.setDynamicProperty("lu_agi", 10);
+    a.setDynamicProperty("lu_agi", 5); // max: Speed V
     advance(101);
     for (let i = 0; i < 100; i++) {
         advance(1);
@@ -176,7 +192,7 @@ await t("AGI speed effect is always present between refreshes", () => {
 await t("AGI speed is applied on respawn, not just by the upkeep loop", () => {
     advance(120);
     const a = newPlayer("kate");
-    a.setDynamicProperty("lu_agi", 10);
+    a.setDynamicProperty("lu_agi", 5);
     // Land immediately after an upkeep pass, then wipe its effect, so the only
     // thing that can restore speed before the next 100-tick pass is playerSpawn.
     for (let i = 0; i < 100 && !a.getEffect("speed"); i++) advance(1);
@@ -186,6 +202,25 @@ await t("AGI speed is applied on respawn, not just by the upkeep loop", () => {
     advance(15);
     assert.ok(a.getEffect("speed"),
         "no speed 15 ticks after respawn; the upkeep loop is up to 100 ticks away");
+});
+
+await t("AGI 0 clears our own speed but leaves a foreign speed alone", () => {
+    advance(120);
+    const o = newPlayer("owen");
+    o.setDynamicProperty("lu_agi", 3);
+    advance(120);
+    assert.ok(o.getEffect("speed"), "precondition: no speed was granted");
+    o.setDynamicProperty("lu_agi", 0); // stat reset
+    advance(120);
+    assert.ok(!o.getEffect("speed"), "stale speed not cleared after AGI reset");
+    o.isValid = false;
+    harness.players = harness.players.filter((x) => x !== o);
+
+    const f = newPlayer("freda");
+    f.setDynamicProperty("lu_agi", 0);
+    f.addEffect("speed", 20000, { amplifier: 2 }); // beacon / potion
+    advance(120);
+    assert.ok(f.getEffect("speed") !== undefined, "a foreign speed was stripped at AGI 0");
 });
 
 // --- 8. hologram lifecycle ---
@@ -351,7 +386,7 @@ await t("tapping a maxed stat does not re-open when nothing is spendable", async
     const sp = newPlayer("trapper");
     sp.setDynamicProperty("lu_points", 5);
     sp.setDynamicProperty("lu_str", 50);
-    sp.setDynamicProperty("lu_dur", 50);
+    sp.setDynamicProperty("lu_dur", 25);
     sp.setDynamicProperty("lu_agi", 5);
     formLog.shown.length = 0;
     formLog.respond = () => ({ canceled: false, selection: 0 }); // keeps tapping STR
@@ -391,6 +426,19 @@ await t("Close button does not spend a point", async () => {
     formLog.respond = null;
 });
 
+await t("spending the last point does not pop an empty form", async () => {
+    advance(120);
+    const sp = newPlayer("lastpoint");
+    sp.setDynamicProperty("lu_points", 1);
+    formLog.respond = () => ({ canceled: false, selection: 0 });
+    formLog.shown.length = 0;
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sp });
+    await advanceAsync(60);
+    assert.strictEqual(sp.getDynamicProperty("lu_points"), 0, "point was not spent");
+    assert.strictEqual(formsFor(sp), 1, "empty form re-opened with 0 points (" + formsFor(sp) + ")");
+    formLog.respond = null;
+});
+
 // --- 10. scriptevent fallback ---
 await t("/scriptevent lu:stats opens the SYSTEM", () => {
     advance(120);
@@ -399,6 +447,33 @@ await t("/scriptevent lu:stats opens the SYSTEM", () => {
     system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
     advance(15);
     assert.ok(formsFor(z) >= 1, "scriptevent did not open the form");
+});
+
+await t("rapid /scriptevent spam does not stack forms", () => {
+    advance(120);
+    const z = newPlayer("spammer");
+    formLog.shown.length = 0;
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
+    advance(30);
+    assert.strictEqual(formsFor(z), 1, "scriptevent spam stacked " + formsFor(z) + " forms");
+});
+
+await t("legacy over-cap stats clamp and refund as points", () => {
+    advance(120);
+    const m = newPlayer("migrant");
+    m.setDynamicProperty("lu_str", 55); // 5 over MAX_STAT
+    m.setDynamicProperty("lu_dur", 30); // 5 over DUR_CAP 25
+    m.setDynamicProperty("lu_agi", 8); // 3 over AGI_CAP 5
+    m.setDynamicProperty("lu_points", 0);
+    const victim = m.dimension.spawnEntity("minecraft:zombie", m.location);
+    world.afterEvents.entityDie.emit({ damageSource: { damagingEntity: m }, deadEntity: victim });
+    advance(5);
+    assert.strictEqual(m.getDynamicProperty("lu_str"), 50, "STR not clamped");
+    assert.strictEqual(m.getDynamicProperty("lu_dur"), 25, "DUR not clamped");
+    assert.strictEqual(m.getDynamicProperty("lu_agi"), 5, "AGI not clamped");
+    assert.strictEqual(m.getDynamicProperty("lu_points"), 13, "excess was not refunded (got " + m.getDynamicProperty("lu_points") + ")");
 });
 
 // --- 11. leak checks ---
