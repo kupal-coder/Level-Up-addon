@@ -4,11 +4,14 @@ import { ActionFormData } from "@minecraft/server-ui";
 // ---- Tuning knobs ----
 const POINTS_PER_LEVEL = 3;
 const STR_DMG_PER_POINT = 0.5; // bonus melee damage per STR
-const HP_PER_DUR = 2; // +1 heart per DUR (20 = 10 hearts base)
+// health_boost only steps in 4 HP, so each DUR point must buy a full step.
+// HP_PER_DUR was 2, which quantized pairs of DUR to the same max HP
+// (1-2 -> 24, 3-4 -> 28, ...) and sold every even point for nothing.
+const HP_PER_DUR = 4; // +2 hearts per DUR (20 = 10 hearts base)
 const GESTURE_WINDOW = 60; // ticks to land both jumps while sneaking
 const DISMISS_WINDOW = 40; // ticks after a jump that a mid-air sneak banishes the board
 const JUMP_DEBOUNCE = 6; // ticks; one physical jump must only ever count once
-const SNEAK_GRACE = 12; // ticks a crouch still counts after jumping breaks it
+const SNEAK_GRACE = 20; // ticks a crouch still counts after jumping breaks it
 const UI_COOLDOWN = 60; // ticks after opening before gesture works again
 const MAX_STAT = 50;
 // Speed has exactly five tiers, and every point has to buy one. An earlier model
@@ -17,6 +20,9 @@ const MAX_STAT = 50;
 // while still printing "Speed 5". One point per tier removes the banding; the
 // price is a cap of 5 instead of 20.
 const AGI_CAP = 5;
+// DUR maxes at the same 120 HP the old 50x2 model topped out at (20 + 25x4),
+// so every point buys exactly one 4-HP step and none is ever a no-op.
+const DUR_CAP = 25;
 const AURA_MIN_LEVEL = 5; // level at which players get an idle wisp aura
 
 const xpNext = (level) => level * 50;
@@ -35,13 +41,20 @@ function loadStats(player) {
         agi: num(player.getDynamicProperty("lu_agi")),
     };
     if (s.level < 1) s.level = 1;
+    // Migrate legacy over-cap saves (AGI cap 5 since v1.3.4, DUR cap 25 since
+    // v1.4.0): clamp to the cap and refund the excess as points so power is
+    // preserved. Idempotent: recomputed from stored values until the next save.
+    if (s.str > MAX_STAT) { s.points += s.str - MAX_STAT; s.str = MAX_STAT; }
+    if (s.dur > DUR_CAP) { s.points += s.dur - DUR_CAP; s.dur = DUR_CAP; }
+    if (s.agi > AGI_CAP) { s.points += s.agi - AGI_CAP; s.agi = AGI_CAP; }
     return s;
 }
 
 function saveStats(player, s) {
     try {
-        // A half-written block would leave `lu_points` decremented without the
-        // matching stat bump, i.e. a silently destroyed point.
+        // Best-effort atomicity: the script is single-threaded, so no leave can
+        // interleave these writes mid-tick. The isValid check only guards the
+        // already-gone case, not a true transaction (dynamic properties have none).
         if (!player.isValid) return;
         player.setDynamicProperty("lu_level", s.level);
         player.setDynamicProperty("lu_xp", s.xp);
@@ -53,9 +66,12 @@ function saveStats(player, s) {
 }
 
 // Highest value of `key` that still changes something. Agility saturates early;
-// Strength and Durability scale all the way to MAX_STAT.
+// Durability saturates at DUR_CAP (same 120 max HP as the old 50x2 model);
+// Strength scales all the way to MAX_STAT.
 function statCap(key) {
-    return key === "agi" ? AGI_CAP : MAX_STAT;
+    if (key === "agi") return AGI_CAP;
+    if (key === "dur") return DUR_CAP;
+    return MAX_STAT;
 }
 
 // Is there anywhere left to put a point? A re-open is only worth it if the player
@@ -78,18 +94,25 @@ let maxHpWritable = undefined; // undefined = not probed yet, false = use health
 // effect apart from one granted by /effect, a datapack or another addon.
 const BOOST_AMP_PROP = "lu_boost_amp";
 
-// health_boost grants +4 max HP per amplifier level (amplifier 0 == +4), so the
-// fallback can only step in 4s. Round to the nearest step instead of always
-// rounding up, and report the real number in the UI (see maxHpOf) rather than
-// the ideal one, so the form never promises hearts the player does not have.
+// health_boost grants +4 max HP per amplifier level (amplifier 0 == +4), and
+// HP_PER_DUR is 4, so every DUR point is exactly one step. Report the real
+// number in the UI (see maxHpOf) rather than the ideal one, so the form never
+// promises hearts the player does not have.
 function healthBoostAmplifier(dur) {
     const steps = Math.max(1, Math.round((dur * HP_PER_DUR) / 4));
     return Math.max(0, Math.min(255, steps - 1));
 }
 
-// Real max HP if the engine will tell us, otherwise the intended value.
+// Real max HP if the engine will tell us and the boost is ours, otherwise the
+// intended value. A foreign health_boost (/effect, datapack, another addon)
+// would otherwise inflate the DUR line (e.g. DUR 0 showing 40 max HP).
 function maxHpOf(player, s) {
     try {
+        const cur = player.getEffect("health_boost");
+        const mine = num(player.getDynamicProperty(BOOST_AMP_PROP), -1);
+        if (cur !== undefined && !(mine >= 0 && cur.amplifier === mine)) {
+            return 20 + s.dur * HP_PER_DUR;
+        }
         const v = player.getComponent("health")?.effectiveMax;
         if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.round(v);
     } catch { /* unreadable */ }
@@ -179,10 +202,24 @@ function agiAmplifier(agi) {
 // Single place that (re)grants the AGI speed effect, so joining/respawning and the
 // upkeep loop can never drift apart. 200 ticks > the 100-tick refresh, so the effect
 // is always present between passes and never blinks out.
+// Records the amplifier like the DUR boost, so an AGI reset only removes our own
+// speed and never a beacon/potion speed from another source.
+const SPEED_AMP_PROP = "lu_speed_amp";
 function applyAgility(player) {
     try {
-        const agi = num(player.getDynamicProperty("lu_agi"));
-        if (agi <= 0) return;
+        // loadStats clamps legacy over-cap AGI and refunds it, so read through it.
+        const agi = loadStats(player).agi;
+        if (agi <= 0) {
+            try {
+                const cur = player.getEffect("speed");
+                const mine = num(player.getDynamicProperty(SPEED_AMP_PROP), -1);
+                if (cur !== undefined && mine >= 0 && cur.amplifier === mine) {
+                    player.removeEffect("speed");
+                    player.setDynamicProperty(SPEED_AMP_PROP);
+                }
+            } catch { /* ignore */ }
+            return;
+        }
         const want = agiAmplifier(agi);
         // A beacon pyramid or a potion grants speed too, and addEffect "adds or
         // updates" — so writing unconditionally downgraded a stronger speed to ours
@@ -191,6 +228,7 @@ function applyAgility(player) {
         const cur = player.getEffect("speed");
         if (cur !== undefined && cur.amplifier > want) return;
         player.addEffect("speed", 200, { amplifier: want, showParticles: false });
+        try { player.setDynamicProperty(SPEED_AMP_PROP, want); } catch { /* ignore */ }
     } catch { /* effect unavailable */ }
 }
 
@@ -484,9 +522,9 @@ function openSystem(player, retry = 1) {
         .body(
             `§7Level: §f${s.level}  §8(${s.xp}/${need} XP)\n` +
             `§7Stat points: §e${s.points}\n\n` +
-            `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg)\n` +
-            `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP)\n` +
-            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"}${s.agi >= AGI_CAP ? " (max)" : ""})\n\n` +
+            `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg${s.str >= statCap("str") ? " (max)" : ""})\n` +
+            `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP${s.dur >= statCap("dur") ? " (max)" : ""})\n` +
+            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"}${s.agi >= statCap("agi") ? " (max)" : ""})\n\n` +
             `§8Tap a stat to spend 1 point.`
         )
         .button("§c⚔ Strength +1")
@@ -531,9 +569,10 @@ function openSystem(player, retry = 1) {
         setActionBar(player, `§e${names[key]} §7→ §f${st[key]}`);
         tell(player, `§b[SYSTEM] §f${names[key]} §7→ §f${st[key]} §8(${st.points} points left)`);
         try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
-        // Re-open so points can be spent in a row. 10 ticks: reopening too fast
-        // lands while the old form is still closing and comes back UserBusy.
-        system.runTimeout(() => openSystem(player, 1), 10);
+        // Re-open so points can be spent in a row (only while something is still
+        // spendable — otherwise the last spend pops an empty form). 10 ticks:
+        // reopening too fast lands while the old form is still closing (UserBusy).
+        if (anySpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
     }).catch(() => { /* player offline / in another UI */ });
 }
 
@@ -670,10 +709,20 @@ system.runInterval(() => {
 
 // Gesture state is per-player; drop it when they leave instead of letting the
 // map grow until it happens to pass an arbitrary size threshold.
+// Declared here (before first use) so the leave handler can also drop STR
+// anti-recursion keys for the departed player.
+const bonusHitAt = new Map(); // "victim|hitter" -> tick of last bonus damage (anti-recursion)
 try {
     world.afterEvents.playerLeave.subscribe((ev) => {
         gesture.delete(ev.playerId);
         holoBoards.delete(ev.playerId);
+        try {
+            for (const k of bonusHitAt.keys()) {
+                if (k === ev.playerId || k.startsWith(ev.playerId + "|") || k.endsWith("|" + ev.playerId)) {
+                    bonusHitAt.delete(k);
+                }
+            }
+        } catch { /* ignore */ }
     });
 } catch { /* ignore */ }
 
@@ -718,8 +767,11 @@ world.afterEvents.entityDie.subscribe((ev) => {
 // taken and the net result is exactly the STR bonus, still credited to the
 // player so kills award XP. entityHurt is used because it reports the real,
 // post-armor damage number that the i-frame window is holding.
-const bonusHitAt = new Map(); // "victim|hitter" -> tick of last bonus damage (anti-recursion)
-
+// Known limitation: the re-applied (dealt + bonus) goes through armor a second
+// time, so against heavily armored targets the net can shrink below the full
+// bonus (unarmored mobs — the common case — land exactly the bonus). There is
+// no armor-value API in stable 2.0.0 to compensate, and a direct HP write would
+// lose kill credit/XP, so entityAttack re-apply stays the correct trade-off.
 world.afterEvents.entityHurt.subscribe((ev) => {
     try {
         const source = ev.damageSource;
@@ -736,8 +788,10 @@ world.afterEvents.entityHurt.subscribe((ev) => {
 
         const now = system.currentTick;
         const key = `${target.id}|${hitter.id}`;
-        // Our own applyDamage re-fires this event; never let the bonus compound.
-        if (now - (bonusHitAt.get(key) ?? -100) < 5) return;
+        // Our own applyDamage re-fires this event next tick; never let the bonus
+        // compound. Window is 2 ticks (own re-fire is +1) so legit spam hits 2+
+        // ticks apart still land their bonus.
+        if (now - (bonusHitAt.get(key) ?? -100) < 2) return;
         bonusHitAt.set(key, now);
         if (bonusHitAt.size > 200) {
             for (const [k, t] of bonusHitAt) if (now - t > 20) bonusHitAt.delete(k);
@@ -792,7 +846,12 @@ function openFromCommand(player) {
     try {
         if (!player?.isValid) return;
         const g = gestureState(player);
-        g.cooldownUntil = system.currentTick + UI_COOLDOWN;
+        const now = system.currentTick;
+        // Throttle like the gesture path: spamming /scriptevent must not stack
+        // forms (each would schedule + retry). UserBusy retries call openSystem
+        // directly and are unaffected.
+        if (now < g.cooldownUntil) return;
+        g.cooldownUntil = now + UI_COOLDOWN;
         openSystemAnimated(player);
     } catch { /* ignore */ }
 }

@@ -20,14 +20,14 @@ await import("../LevelUp_BP/scripts/main.js");
 // amplifier is the only reliable proof the boost on the player is ours.
 const p = new harness.Player("stale");
 harness.players.push(p);
-p.setDynamicProperty("lu_dur", 6); // 6 * 2 = 12 HP -> 3 steps -> amplifier 2
+p.setDynamicProperty("lu_dur", 6); // 6 * 4 = 24 HP -> 6 steps -> amplifier 5
 advance(130); // past the 100-tick upkeep loop
 
 const granted = p.getEffect("health_boost");
 assert.ok(granted !== undefined, "precondition: the addon should have granted a boost");
-assert.strictEqual(granted.amplifier, 2, "unexpected amplifier granted");
-assert.strictEqual(p.getDynamicProperty("lu_boost_amp"), 2, "the granted amplifier was not recorded");
-assert.strictEqual(p.getComponent("health").effectiveMax, 32, "precondition: max HP should be inflated");
+assert.strictEqual(granted.amplifier, 5, "unexpected amplifier granted");
+assert.strictEqual(p.getDynamicProperty("lu_boost_amp"), 5, "the granted amplifier was not recorded");
+assert.strictEqual(p.getComponent("health").effectiveMax, 44, "precondition: max HP should be inflated");
 
 p.setDynamicProperty("lu_dur", 0); // stat reset
 advance(130);
