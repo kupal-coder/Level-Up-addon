@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+    branches: [main, "arena/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check JS syntax + manifest
+        run: npm run check
+      - name: Run test suite (35 core + fresh-session regression)
+        run: npm test
+      - name: Run extended coverage suite
+        run: node tests/coverage.test.mjs
+      - name: Verify .mcpack matches source
+        run: bash scripts/verify-pack.sh
+      - name: Enforce single current .mcpack
+        run: |
+          count=$(ls LevelUp_v*.mcpack 2>/dev/null | wc -l)
+          echo "mcpack count: $count"
+          [ "$count" -eq 1 ] || { echo "Expected exactly 1 LevelUp_v*.mcpack (see AGENTS.md)"; exit 1; }
+          echo "pack count OK"
+

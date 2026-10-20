@@ -1,0 +1,4 @@
+# Treat packs as binary and generated
+*.mcpack binary linguist-generated
+*.zip binary
+pack_icon.png binary
