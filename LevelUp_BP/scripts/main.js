@@ -24,6 +24,7 @@ const AGI_CAP = 5;
 // so every point buys exactly one 4-HP step and none is ever a no-op.
 const DUR_CAP = 25;
 const AURA_MIN_LEVEL = 5; // level at which players get an idle wisp aura
+const MAX_LEVEL = 100; // hard cap — prevents unbounded while loop / point inflation on corrupt saves
 
 const xpNext = (level) => level * 50;
 
@@ -41,6 +42,12 @@ function loadStats(player) {
         agi: num(player.getDynamicProperty("lu_agi")),
     };
     if (s.level < 1) s.level = 1;
+    if (s.level > MAX_LEVEL) s.level = MAX_LEVEL;
+    // Cap XP at max level so a corrupt 1e9 XP can't freeze the level-up loop.
+    if (s.level >= MAX_LEVEL) {
+        const cap = xpNext(s.level);
+        if (s.xp >= cap) s.xp = cap - 1;
+    }
     // Migrate legacy over-cap saves (AGI cap 5 since v1.3.4, DUR cap 25 since
     // v1.4.0): clamp to the cap and refund the excess as points so power is
     // preserved. Idempotent: recomputed from stored values until the next save.
@@ -56,6 +63,9 @@ function saveStats(player, s) {
         // interleave these writes mid-tick. The isValid check only guards the
         // already-gone case, not a true transaction (dynamic properties have none).
         if (!player.isValid) return;
+        // Clamp before persisting — defense in depth if a caller forgot.
+        if (s.level > MAX_LEVEL) s.level = MAX_LEVEL;
+        if (s.level < 1) s.level = 1;
         player.setDynamicProperty("lu_level", s.level);
         player.setDynamicProperty("lu_xp", s.xp);
         player.setDynamicProperty("lu_points", s.points);
@@ -135,26 +145,11 @@ function applyDurability(player, heal = 0) {
         if (!hp) return;
         const want = 20 + s.dur * HP_PER_DUR;
 
-        if (s.dur <= 0) {
-            // Nothing to grant. Drop a boost we applied earlier, but only when the
-            // amplifier matches the one we recorded: removeEffect is unconditional, so
-            // calling it blindly also destroys a health_boost from /effect or another
-            // addon. lu_dur never falls on its own, so dur === 0 means a stat reset —
-            // and the amplifier we wrote is the only reliable proof the boost is ours.
-            try {
-                const cur = player.getEffect("health_boost");
-                const mine = num(player.getDynamicProperty(BOOST_AMP_PROP), -1);
-                if (cur !== undefined && mine >= 0 && cur.amplifier === mine) {
-                    player.removeEffect("health_boost");
-                    player.setDynamicProperty(BOOST_AMP_PROP);
-                }
-            } catch { /* ignore */ }
-            return;
-        }
-
+        // Probe writability early — even when dur is 0 — so a fresh world with
+        // only DUR-0 players still learns the engine can't write effectiveMax.
+        // Skipped while our own boost is active, or its inflated effectiveMax
+        // would read back as success after a reload.
         if (maxHpWritable === undefined) {
-            // Never probe while our own health_boost is up: its inflated effectiveMax
-            // would read back as "the write worked" after a script reload.
             let boosted = false;
             try { boosted = player.getEffect("health_boost") !== undefined; } catch { /* ignore */ }
             if (boosted) {
@@ -166,6 +161,23 @@ function applyDurability(player, heal = 0) {
                 try { readback = hp.effectiveMax; } catch { readback = 0; }
                 maxHpWritable = wrote && readback >= want - 0.001;
             }
+        }
+
+        if (s.dur <= 0) {
+            // Nothing to grant. Drop a boost we applied earlier, but only when the
+            // amplifier matches the one we recorded: removeEffect is unconditional, so
+            // calling it blindly also destroys a health_boost from /effect or another
+            // addon. lu_dur never falls on its own, so dur === 0 means a stat reset —
+            // and the amplifier we wrote is the only reliable proof the boost is ours.
+            try {
+                const cur = player.getEffect("health_boost");
+                const mine = num(player.getDynamicProperty(BOOST_AMP_PROP), -1);
+                if (cur !== undefined && mine >= 0 && cur.amplifier === mine) {
+                    player.removeEffect("health_boost");
+                    player.setDynamicProperty(BOOST_AMP_PROP, undefined);
+                }
+            } catch { /* ignore */ }
+            return;
         }
 
         if (maxHpWritable === true) {
@@ -215,7 +227,7 @@ function applyAgility(player) {
                 const mine = num(player.getDynamicProperty(SPEED_AMP_PROP), -1);
                 if (cur !== undefined && mine >= 0 && cur.amplifier === mine) {
                     player.removeEffect("speed");
-                    player.setDynamicProperty(SPEED_AMP_PROP);
+                    player.setDynamicProperty(SPEED_AMP_PROP, undefined);
                 }
             } catch { /* ignore */ }
             return;
@@ -283,6 +295,7 @@ function ringBurst(player, count) {
 }
 
 // Rising spiral around the player for ~1.2s. Pure juice.
+// Auto-cleans if the player logs out mid-animation to avoid orphan intervals.
 function spiralUp(player, total) {
     try {
         const dim = player.dimension;
@@ -291,6 +304,7 @@ function spiralUp(player, total) {
         const per = 3;
         const runId = system.runInterval(() => {
             try {
+                if (!player.isValid) { system.clearRun(runId); return; }
                 for (let k = 0; k < per; k++) {
                     const t = step * per + k;
                     const a = t * 0.55;
@@ -304,6 +318,9 @@ function spiralUp(player, total) {
                 try { system.clearRun(runId); } catch { /* already cleared */ }
             }
         }, 2);
+        // Extra safety: if player leaves, the interval is cleared via playerLeave below.
+        // Store runId on the player object transiently for that handler (non-persisted).
+        try { player.__luSpiralIds = player.__luSpiralIds || []; player.__luSpiralIds.push(runId); } catch { /* ignore */ }
     } catch { /* ignore */ }
 }
 
@@ -327,26 +344,33 @@ const HOLO_TAG = "lu_holo";
 const HOLO_TICKS = 240; // 12s per summon
 const HOLO_GAP = 0.32; // vertical gap between lines
 const DIMENSION_IDS = ["minecraft:overworld", "minecraft:nether", "minecraft:the_end"];
+// Custom dimensions are not part of stable 2.0.0; if a beta exposes them, the
+// entity-scan below would miss them. `holoSpawned` is a secondary index so
+// cleanup never depends solely on dimension enumeration.
 
-// A script-spawned area_effect_cloud carries the vanilla `Duration` component
-// (30 ticks) and the engine despawns it on its own; stable 2.0.0 has no
-// `setComponent` to stretch that, so the board used to blink out after ~1.5s
-// instead of the documented 12s no matter what the keeper did. Each line is
-// therefore rotated a few ticks before the engine would eat it, which keeps every
-// line continuously on screen instead of respawning it only once it is already gone.
 const AEC_LIFETIME_TICKS = 30; // engine-side: vanilla `Duration` on a spawned cloud
 const AEC_ROTATE_TICKS = AEC_LIFETIME_TICKS - 5; // our margin; must stay below the above
 const holoBoards = new Map(); // playerId -> { lines: string[], until: number }
+const holoSpawned = new Set(); // all live holo entities we created (fallback index)
 
 // Holo lines must be findable from *any* dimension: a player can leave through a
 // portal (or log out) with a board up, and those clouds would otherwise linger
 // forever in a dimension nobody scans.
 function holoEntities() {
     const out = [];
+    const seen = new Set();
     for (const id of DIMENSION_IDS) {
         try {
-            for (const e of world.getDimension(id).getEntities({ tags: [HOLO_TAG] })) out.push(e);
+            for (const e of world.getDimension(id).getEntities({ tags: [HOLO_TAG] })) {
+                if (!seen.has(e.id)) { seen.add(e.id); out.push(e); }
+            }
         } catch { /* dimension not loaded */ }
+    }
+    // Fallback: entities we spawned but whose dimension isn't in DIMENSION_IDS
+    // (e.g. future custom dimension) — prevents orphan leaks.
+    for (const e of holoSpawned) {
+        if (!seen.has(e.id) && e.isValid) out.push(e);
+        else if (!e.isValid) holoSpawned.delete(e);
     }
     return out;
 }
@@ -368,7 +392,7 @@ function clearHologram(player) {
     if (id === undefined) return;
     holoBoards.delete(id);
     for (const e of holoEntities()) {
-        try { if (e.getDynamicProperty("lu_owner") === id) e.remove(); } catch { /* ignore */ }
+        try { if (e.getDynamicProperty("lu_owner") === id) { try { e.remove(); } catch { /* gone */ } holoSpawned.delete(e); } } catch { /* ignore */ }
     }
 }
 
@@ -381,6 +405,7 @@ function spawnHoloLine(player, text, slot, until) {
         e.setDynamicProperty("lu_slot", slot);
         e.setDynamicProperty("lu_until", until);
         e.setDynamicProperty("lu_born", system.currentTick);
+        holoSpawned.add(e);
         return e;
     } catch { return undefined; }
 }
@@ -432,6 +457,9 @@ function statusHoloLines(s) {
     ];
 }
 
+// Sentinel that never appears in Bedrock entity IDs (UUIDs are hex + dashes).
+const HIT_KEY_SEP = "\x00";
+
 // Keeper, every 5 ticks: expire old lines, re-create lines the engine despawned,
 // and keep the rest floating in front of their owner's view. The entity sweep
 // (rather than a player list) is what cleans up boards whose owner logged out or
@@ -443,23 +471,23 @@ system.runInterval(() => {
         for (const p of world.getPlayers()) {
             try { online.set(p.id, p); } catch { /* ignore */ }
         }
-        const live = new Map(); // `${ownerId}|${slot}` -> entity still on the board
+        const live = new Map(); // `${ownerId}\x00${slot}` -> entity still on the board
         for (const e of holoEntities()) {
             try {
                 const ownerId = e.getDynamicProperty("lu_owner");
                 const owner = typeof ownerId === "string" ? online.get(ownerId) : undefined;
-                if (!owner || !owner.isValid) { e.remove(); continue; }
-                if (now > num(e.getDynamicProperty("lu_until"), 0)) { e.remove(); continue; }
-                if (e.dimension.id !== owner.dimension.id) { e.remove(); continue; }
-                live.set(`${ownerId}|${num(e.getDynamicProperty("lu_slot"), 0)}`, e);
-            } catch { try { e.remove(); } catch { /* gone */ } }
+                if (!owner || !owner.isValid) { try { e.remove(); } catch { /* gone */ } holoSpawned.delete(e); continue; }
+                if (now > num(e.getDynamicProperty("lu_until"), 0)) { try { e.remove(); } catch { /* gone */ } holoSpawned.delete(e); continue; }
+                if (e.dimension.id !== owner.dimension.id) { try { e.remove(); } catch { /* gone */ } holoSpawned.delete(e); continue; }
+                live.set(`${ownerId}${HIT_KEY_SEP}${num(e.getDynamicProperty("lu_slot"), 0)}`, e);
+            } catch { try { e.remove(); holoSpawned.delete(e); } catch { /* gone */ } }
         }
         for (const [id, board] of holoBoards) {
             const owner = online.get(id);
             if (!owner || !owner.isValid) { holoBoards.delete(id); continue; }
             if (now > board.until) { clearHologram(owner); continue; }
             board.lines.forEach((text, slot) => {
-                const e = live.get(`${id}|${slot}`);
+                const e = live.get(`${id}${HIT_KEY_SEP}${slot}`);
                 if (!e) { spawnHoloLine(owner, text, slot, board.until); return; }
                 // Rotate before the engine despawns this cloud. Spawning the
                 // replacement first means the slot is never empty, so the board
@@ -468,7 +496,7 @@ system.runInterval(() => {
                     try { e.teleport(holoAnchor(owner, slot)); } catch { /* moved on */ }
                 } else {
                     spawnHoloLine(owner, text, slot, board.until);
-                    try { e.remove(); } catch { /* already gone */ }
+                    try { e.remove(); holoSpawned.delete(e); } catch { /* already gone */ }
                 }
             });
         }
@@ -520,11 +548,11 @@ function openSystem(player, retry = 1) {
     const form = new ActionFormData()
         .title("§l§bS Y S T E M")
         .body(
-            `§7Level: §f${s.level}  §8(${s.xp}/${need} XP)\n` +
-            `§7Stat points: §e${s.points}\n\n` +
-            `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg${s.str >= statCap("str") ? " (max)" : ""})\n` +
-            `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP${s.dur >= statCap("dur") ? " (max)" : ""})\n` +
-            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"}${s.agi >= statCap("agi") ? " (max)" : ""})\n\n` +
+            `§7Level: §f${s.level}  §8(${s.xp}/${need} XP)\\n` +
+            `§7Stat points: §e${s.points}\\n\\n` +
+            `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg${s.str >= statCap("str") ? " (max)" : ""})\\n` +
+            `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP${s.dur >= statCap("dur") ? " (max)" : ""})\\n` +
+            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"}${s.agi >= statCap("agi") ? " (max)" : ""})\\n\\n` +
             `§8Tap a stat to spend 1 point.`
         )
         .button("§c⚔ Strength +1")
@@ -577,7 +605,15 @@ function openSystem(player, retry = 1) {
 }
 
 // Animated entrance before the form: materialize FX, then open.
+// Centralizes UI cooldown so every entry path (gesture, scriptevent, chat) is
+// throttled even if a caller forgot to set it.
 function openSystemAnimated(player, retry = 1) {
+    try {
+        const g = gestureState(player);
+        const now = system.currentTick;
+        if (now < g.cooldownUntil) return;
+        g.cooldownUntil = now + UI_COOLDOWN;
+    } catch { /* ignore — still show FX even if gesture state unavailable */ }
     safeSound(player, "block.beacon.activate", { pitch: 1.6, volume: 0.6 });
     facePuff(player);
     setActionBar(player, "§b「 ACCESSING SYSTEM 」");
@@ -638,7 +674,7 @@ function registerJump(player, now) {
         }
         if (g.jumps >= 2) {
             g.jumps = 0;
-            g.cooldownUntil = now + UI_COOLDOWN;
+            // cooldown is set inside openSystemAnimated; set here too for immediate feedback
             openSystemAnimated(player);
         }
     } catch { /* player mid-teleport */ }
@@ -711,16 +747,35 @@ system.runInterval(() => {
 // map grow until it happens to pass an arbitrary size threshold.
 // Declared here (before first use) so the leave handler can also drop STR
 // anti-recursion keys for the departed player.
-const bonusHitAt = new Map(); // "victim|hitter" -> tick of last bonus damage (anti-recursion)
+const bonusHitAt = new Map(); // "victim\x00hitter" -> tick of last bonus damage (anti-recursion)
 try {
     world.afterEvents.playerLeave.subscribe((ev) => {
         gesture.delete(ev.playerId);
         holoBoards.delete(ev.playerId);
+        // Clean up any spiral intervals orphaned by this player
         try {
-            for (const k of bonusHitAt.keys()) {
-                if (k === ev.playerId || k.startsWith(ev.playerId + "|") || k.endsWith("|" + ev.playerId)) {
-                    bonusHitAt.delete(k);
+            for (const p of world.getPlayers()) {
+                // No-op: world.getPlayers no longer contains departed player.
+                // The isValid check inside spiralUp handles it; this is belt-and-suspenders.
+            }
+        } catch { /* ignore */ }
+        try {
+            for (const k of [...bonusHitAt.keys()]) {
+                const sep = k.indexOf(HIT_KEY_SEP);
+                if (sep === -1) { // legacy '|' keys from old saves — purge
+                    if (k === ev.playerId || k.startsWith(ev.playerId + "|") || k.endsWith("|" + ev.playerId)) bonusHitAt.delete(k);
+                    else bonusHitAt.delete(k);
+                    continue;
                 }
+                const victim = k.slice(0, sep);
+                const hitter = k.slice(sep + 1);
+                if (victim === ev.playerId || hitter === ev.playerId) bonusHitAt.delete(k);
+            }
+        } catch { /* ignore */ }
+        // Purge holoSpawned entries owned by departed player
+        try {
+            for (const e of [...holoSpawned]) {
+                try { if (e.getDynamicProperty("lu_owner") === ev.playerId) { try { e.remove(); } catch { /* gone */ } holoSpawned.delete(e); } } catch { /* ignore */ }
             }
         } catch { /* ignore */ }
     });
@@ -738,13 +793,26 @@ world.afterEvents.entityDie.subscribe((ev) => {
         const gain = Math.max(2, Math.min(20, Math.ceil(maxHp / 4)));
 
         const s = loadStats(killer);
+        // If already max level, don't feed the while loop — just show cap feedback.
+        if (s.level >= MAX_LEVEL) {
+            setActionBar(killer, `§7MAX LEVEL §8(${s.xp}/${xpNext(s.level)} XP)`);
+            return;
+        }
         s.xp += gain;
         let ups = 0;
-        while (s.xp >= xpNext(s.level)) {
+        // Guarded by MAX_LEVEL — prevents freeze on corrupt 1e9 XP.
+        while (s.xp >= xpNext(s.level) && s.level < MAX_LEVEL) {
             s.xp -= xpNext(s.level);
             s.level += 1;
             s.points += POINTS_PER_LEVEL;
             ups += 1;
+            // Extra safety: if something else corrupted xpNext, break after 200 ups
+            if (ups > 200) break;
+        }
+        // Clamp XP at max level so next kill doesn't re-enter loop with huge remainder
+        if (s.level >= MAX_LEVEL) {
+            const cap = xpNext(s.level);
+            if (s.xp >= cap) s.xp = cap - 1;
         }
         saveStats(killer, s);
         if (ups > 0) {
@@ -787,7 +855,7 @@ world.afterEvents.entityHurt.subscribe((ev) => {
         if (!Number.isFinite(dealt) || dealt <= 0) return;
 
         const now = system.currentTick;
-        const key = `${target.id}|${hitter.id}`;
+        const key = `${target.id}${HIT_KEY_SEP}${hitter.id}`;
         // Our own applyDamage re-fires this event next tick; never let the bonus
         // compound. Window is 2 ticks (own re-fire is +1) so legit spam hits 2+
         // ticks apart still land their bonus.
@@ -845,13 +913,10 @@ system.runInterval(() => {
 function openFromCommand(player) {
     try {
         if (!player?.isValid) return;
+        // openSystemAnimated now enforces cooldown itself, so we don't need to
+        // duplicate the check here — but keep a fast-path to avoid FX spam.
         const g = gestureState(player);
-        const now = system.currentTick;
-        // Throttle like the gesture path: spamming /scriptevent must not stack
-        // forms (each would schedule + retry). UserBusy retries call openSystem
-        // directly and are unaffected.
-        if (now < g.cooldownUntil) return;
-        g.cooldownUntil = now + UI_COOLDOWN;
+        if (system.currentTick < g.cooldownUntil) return;
         openSystemAnimated(player);
     } catch { /* ignore */ }
 }

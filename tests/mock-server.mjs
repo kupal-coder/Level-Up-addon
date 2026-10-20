@@ -64,7 +64,10 @@ class Ent {
     }
     addTag(t) { this.tags.add(t); }
     getDynamicProperty(k) { return this.props.get(k); }
-    setDynamicProperty(k, v) { this.props.set(k, v); }
+    setDynamicProperty(k, v) {
+        if (v === undefined) this.props.delete(k);
+        else this.props.set(k, v);
+    }
     remove() { this.isValid = false; harness.entities = harness.entities.filter((e) => e !== this); }
     teleport(loc) { this.location = { ...loc }; }
     getVelocity() { return { x: 0, y: this.vy ?? 0, z: 0 }; }
