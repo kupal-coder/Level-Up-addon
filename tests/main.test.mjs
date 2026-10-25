@@ -783,6 +783,64 @@ await t("stale health_boost is dropped before effectiveMax is ever probed", () =
     assert.strictEqual(r.status, 0, (r.stdout || "") + (r.stderr || ""));
 });
 
+// --- 13. stored-vs-effective clamp regressions ---
+await t("over-cap STR does not deal uncapped bonus damage", () => {
+    harness.damages.length = 0;
+    const s = newPlayer("strCap");
+    s.setDynamicProperty("lu_str", 200); // corrupt/legacy, cap is 50
+    const mob = s.dimension.spawnEntity("minecraft:cow", s.location);
+    world.afterEvents.entityHurt.emit({
+        damageSource: { cause: "entityAttack", damagingEntity: s },
+        hurtEntity: mob, damage: 7,
+    });
+    advance(3);
+    assert.strictEqual(harness.damages.length, 1, "bonus damage not applied");
+    assert.strictEqual(harness.damages[0].amount, 7 + 25, "bonus was not capped at +25, got " + harness.damages[0].amount);
+});
+
+await t("recorded over-cap DUR boost is downgraded to the clamped cap", async () => {
+    advance(120);
+    const d = newPlayer("durBoost");
+    d.setDynamicProperty("lu_dur", 40);      // 15 over DUR_CAP 25
+    d.setDynamicProperty("lu_boost_amp", 39); // the boost this save once earned
+    d.addEffect("health_boost", 20000, { amplifier: 39 });
+    await advanceAsync(101); // one upkeep pass clamps DUR and must follow the boost down
+    const eff = d.getEffect("health_boost");
+    assert.ok(eff, "boost disappeared");
+    assert.strictEqual(eff.amplifier, 24, "boost stayed at amp " + eff.amplifier);
+    assert.strictEqual(d.getComponent("health").effectiveMax, 120, "max HP stayed inflated at " + d.getComponent("health").effectiveMax);
+});
+
+await t("recorded over-cap AGI speed is downgraded to the clamped cap", async () => {
+    advance(120);
+    const a = newPlayer("agiBoost");
+    a.setDynamicProperty("lu_agi", 20);       // 15 over AGI_CAP 5
+    a.setDynamicProperty("lu_speed_amp", 19); // Speed XX from the old save
+    a.addEffect("speed", 20000, { amplifier: 19 });
+    await advanceAsync(101);
+    const eff = a.getEffect("speed");
+    assert.ok(eff, "speed disappeared");
+    assert.strictEqual(eff.amplifier, 4, "stayed at Speed " + (eff.amplifier + 1));
+});
+
+await t("a corrupt non-1 skill flag still counts as owned", async () => {
+    advance(120);
+    const c = newPlayer("skillCorrupt");
+    c.setDynamicProperty("lu_skill_nv", 2);
+    await advanceAsync(101);
+    const eff = c.getEffect("night_vision");
+    assert.ok(eff, "flag 2 was treated as unowned: skill never applied and cannot be removed");
+    assert.strictEqual(eff.amplifier, 0);
+});
+
+await t("killing a non-mob (armor stand) does not award XP", () => {
+    const k = newPlayer("standFarm");
+    const stand = k.dimension.spawnEntity("minecraft:armor_stand", k.location);
+    world.afterEvents.entityDie.emit({ damageSource: { damagingEntity: k }, deadEntity: stand });
+    advance(5);
+    assert.strictEqual(k.getDynamicProperty("lu_xp"), undefined, "armor stand kill awarded XP");
+});
+
 let fails = 0;
 for (const [st, name] of results) {
     if (st === "FAIL") fails++;

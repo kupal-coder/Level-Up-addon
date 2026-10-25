@@ -2,6 +2,18 @@
 
 Follows semver for behavior-pack version (`LevelUp_BP/manifest.json` header `name` + `version` + `LevelUp_vX.Y.Z.mcpack` filename — see `AGENTS.md` release convention).
 
+## v1.4.6
+
+**Bug fixes**
+- Non-mob kills awarded XP. An armor stand is a 20-HP, instantly replaceable entity, so it was a free XP farm; breaking boats/minecarts/paintings paid out too. These are now rejected before any XP/level bookkeeping (`NON_MOB_VICTIMS`).
+- STR bonus damage read the raw `lu_str` property. A legacy/edited value above the 50 cap dealt uncapped bonus damage (e.g. STR 200 → +100 per hit) while `loadStats` was also refunding the excess as points. The hit path now clamps to `statCap("str")`.
+- A recorded DUR boost taller than the clamped cap was treated as "foreign, leave it alone", so an over-cap save kept its inflated max HP forever after the excess was refunded. When the active amplifier matches the recorded one, the addon now owns it and downgrades it to the clamped cap.
+- Same for AGI: a recorded Speed tier above the clamped Agility cap stuck forever. Our own recorded amplifier may now shrink; a strictly stronger *foreign* beacon/potion is still untouched.
+- Corrupt skill flags (e.g. `lu_skill_nv = 2`) failed every `=== 1` check: the skill never applied, never showed as owned, and could not be removed for a refund. Skill flags are normalized to 0/1 on load.
+
+**Tests**
+- 5 new tests (58 core total), each verified to fail against the v1.4.5 script: uncapped STR, over-cap DUR boost, over-cap AGI speed, corrupt skill flag, armor-stand XP.
+
 ## v1.4.5
 
 **Bug fixes**

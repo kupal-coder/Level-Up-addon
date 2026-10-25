@@ -80,7 +80,10 @@ function loadStats(player) {
         skillPoints: num(player.getDynamicProperty("lu_skill_points")),
     };
     for (const sk of SKILLS) {
-        s[`skill_${sk.key}`] = num(player.getDynamicProperty(`lu_skill_${sk.key}`)) || 0;
+        // Normalize corrupted/legacy flags to 0/1. A value like 2 used to fail
+        // every `=== 1` check: the skill was invisible in the menu, impossible
+        // to remove (no refund), and never applied.
+        s[`skill_${sk.key}`] = num(player.getDynamicProperty(`lu_skill_${sk.key}`)) ? 1 : 0;
     }
     if (s.level < 1) s.level = 1;
     if (s.level > MAX_LEVEL) s.level = MAX_LEVEL;
@@ -271,7 +274,13 @@ function applyDurability(player, heal = 0) {
         const wantAmp = healthBoostAmplifier(s.dur);
         try {
             const cur = player.getEffect("health_boost");
-            if (cur === undefined || cur.amplifier <= wantAmp) {
+            const mine = num(player.getDynamicProperty(BOOST_AMP_PROP), -1);
+            // A matching recorded amplifier proves the effect is ours even when it
+            // is *stronger* than wantAmp. Over-cap DUR is clamped on load, and
+            // treating our old, taller boost as foreign kept the inflated max HP
+            // forever while the excess was refunded as points.
+            const ours = cur !== undefined && mine >= 0 && cur.amplifier === mine;
+            if (cur === undefined || ours || cur.amplifier <= wantAmp) {
                 player.addEffect("health_boost", 200, { amplifier: wantAmp, showParticles: false });
                 player.setDynamicProperty(BOOST_AMP_PROP, wantAmp);
             }
@@ -311,10 +320,14 @@ function applyAgility(player) {
         const want = agiAmplifier(agi);
         // A beacon pyramid or a potion grants speed too, and addEffect "adds or
         // updates" — so writing unconditionally downgraded a stronger speed to ours
-        // every upkeep pass. Leave a strictly stronger effect alone; equality still
-        // refreshes our duration, which is what stops the effect blinking out.
+        // every upkeep pass. Leave a strictly stronger *foreign* effect alone;
+        // equality still refreshes our duration, which is what stops the effect
+        // blinking out. Our own recorded amplifier is allowed to shrink when an
+        // over-cap AGI is clamped on load, or the old Speed tier would stick.
         const cur = player.getEffect("speed");
-        if (cur !== undefined && cur.amplifier > want) return;
+        const mine = num(player.getDynamicProperty(SPEED_AMP_PROP), -1);
+        const ours = cur !== undefined && mine >= 0 && cur.amplifier === mine;
+        if (cur !== undefined && cur.amplifier > want && !ours) return;
         player.addEffect("speed", 200, { amplifier: want, showParticles: false });
         try { player.setDynamicProperty(SPEED_AMP_PROP, want); } catch { /* ignore */ }
     } catch { /* effect unavailable */ }
@@ -950,12 +963,32 @@ try {
 } catch { /* ignore */ }
 
 // ---- XP from kills -> level ups -> stat points ----
+// Destroyable entities that are not mobs. Awarding XP for these turned armor
+// stands (20 HP, instantly replaceable) into a free XP farm and also paid for
+// breaking boats/minecarts/paintings. Players themselves are handled separately.
+const NON_MOB_VICTIMS = new Set([
+    "minecraft:armor_stand",
+    "minecraft:boat",
+    "minecraft:chest_boat",
+    "minecraft:minecart",
+    "minecraft:chest_minecart",
+    "minecraft:hopper_minecart",
+    "minecraft:tnt_minecart",
+    "minecraft:furnace_minecart",
+    "minecraft:command_block_minecart",
+    "minecraft:spawner_minecart",
+    "minecraft:item_frame",
+    "minecraft:glow_item_frame",
+    "minecraft:painting",
+]);
+
 world.afterEvents.entityDie.subscribe((ev) => {
     try {
         const killer = ev.damageSource?.damagingEntity;
         if (!killer || killer.typeId !== "minecraft:player") return;
         const victim = ev.deadEntity;
         if (!victim || victim.typeId === "minecraft:player") return;
+        if (NON_MOB_VICTIMS.has(victim.typeId)) return;
         let maxHp = 20;
         try { maxHp = victim.getComponent("health")?.effectiveMax ?? 20; } catch { /* default */ }
         const gain = Math.max(2, Math.min(20, Math.ceil(maxHp / 4)));
@@ -1031,7 +1064,11 @@ world.afterEvents.entityHurt.subscribe((ev) => {
         if (!hitter || hitter.typeId !== "minecraft:player") return;
         const target = ev.hurtEntity;
         if (!target || !target.isValid || target.id === hitter.id) return;
-        const bonus = num(hitter.getDynamicProperty("lu_str")) * STR_DMG_PER_POINT;
+        // Clamp through the same cap loadStats refunds against. Reading the raw
+        // property let a legacy/edited STR above 50 deal uncapped bonus damage
+        // while the excess was also being refunded as points.
+        const str = Math.min(num(hitter.getDynamicProperty("lu_str")), statCap("str"));
+        const bonus = str * STR_DMG_PER_POINT;
         if (bonus <= 0) return;
         const dealt = ev.damage;
         if (!Number.isFinite(dealt) || dealt <= 0) return;

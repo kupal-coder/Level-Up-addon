@@ -57,12 +57,12 @@ Levels also carry a **rank / title** shown on the SYSTEM window and floating boa
 ## Install
 
 1. Copy `LevelUp_BP` to your `development_behavior_packs` folder (or zip it as `.mcpack`).
-2. New world → Behavior Packs → activate **Level Up** v1.4.5. No experiments required.
+2. New world → Behavior Packs → activate **Level Up** v1.4.6. No experiments required.
 3. Kill mobs, then sneak + double-jump to spend points.
 
 Requires Minecraft Bedrock **1.21.90+** (`min_engine_version` [1,21,90], stable `@minecraft/server` 2.0.0). Using an older engine advertises an API the engine can't provide — the addon will fail to load.
 
-**From a zip:** Import `LevelUp_v1.4.5.mcpack` directly — Minecraft installs `LevelUp_BP` for you.
+**From a zip:** Import `LevelUp_v1.4.6.mcpack` directly — Minecraft installs `LevelUp_BP` for you.
 
 **Updating:** Deactivate the old pack, import the new `.mcpack`, re-activate. Your level/stats live in dynamic properties and survive updates. Downgrading across a cap change (e.g. DUR 25) auto-refunds excess as points. Saves from before v1.4.3 receive a one-time back-fill of skill points for levels already earned (`level - 1`).
 
@@ -79,7 +79,7 @@ Requires Minecraft Bedrock **1.21.90+** (`min_engine_version` [1,21,90], stable 
 
 ## For contributors
 
-- `npm test` — 53 core + `stale-boost` isolation test (see `tests/`).
+- `npm test` — 58 core + `stale-boost` isolation test (see `tests/`).
 - `node tests/coverage.test.mjs` — 16 extra regression checks (dismiss, cooldown, portal, aura, MAX_LEVEL, boss XP cap, etc.).
 - `npm run check` — syntax + manifest JSON check.
 - `npm pack @minecraft/server@2.0.0 && npx tsc --allowJs --checkJs --noEmit` — type-check against real Bedrock types.
