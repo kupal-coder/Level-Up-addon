@@ -1,6 +1,6 @@
 {
   "name": "level-up-addon",
-  "version": "1.4.1",
+  "version": "1.4.3",
   "description": "Solo-leveling style stats system for Minecraft Bedrock — LevelUp_BP + verified mock suite",
   "type": "module",
   "private": true,

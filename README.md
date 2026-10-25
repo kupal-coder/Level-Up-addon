@@ -36,12 +36,12 @@ Killing mobs grants XP (stronger mobs = more XP, capped at 20 XP per kill). Each
 ## Install
 
 1. Copy `LevelUp_BP` to your `development_behavior_packs` folder (or zip it as `.mcpack`).
-2. New world → Behavior Packs → activate **Level Up** v1.4.1. No experiments required.
+2. New world → Behavior Packs → activate **Level Up** v1.4.3. No experiments required.
 3. Kill mobs, then sneak + double-jump to spend points.
 
 Requires Minecraft Bedrock **1.21.90+** (`min_engine_version` [1,21,90], stable `@minecraft/server` 2.0.0). Using an older engine advertises an API the engine can't provide — the addon will fail to load.
 
-**From a zip:** Import `LevelUp_v1.4.1.mcpack` directly — Minecraft installs `LevelUp_BP` for you.
+**From a zip:** Import `LevelUp_v1.4.3.mcpack` directly — Minecraft installs `LevelUp_BP` for you.
 
 **Updating:** Deactivate the old pack, import the new `.mcpack`, re-activate. Your level/stats live in dynamic properties and survive updates. Downgrading across a cap change (e.g. DUR 25) auto-refunds excess as points.
 
@@ -58,7 +58,7 @@ Requires Minecraft Bedrock **1.21.90+** (`min_engine_version` [1,21,90], stable 
 
 ## For contributors
 
-- `npm test` — 35 core + `stale-boost` isolation test (see `tests/`).
+- `npm test` — 44 core + `stale-boost` isolation test (see `tests/`).
 - `node tests/coverage.test.mjs` — 16 extra regression checks (dismiss, cooldown, portal, aura, MAX_LEVEL, boss XP cap, etc.).
 - `npm run check` — syntax + manifest JSON check.
 - `npm pack @minecraft/server@2.0.0 && npx tsc --allowJs --checkJs --noEmit` — type-check against real Bedrock types.

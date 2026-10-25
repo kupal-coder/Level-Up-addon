@@ -2,6 +2,21 @@
 
 Follows semver for behavior-pack version (`LevelUp_BP/manifest.json` header `name` + `version` + `LevelUp_vX.Y.Z.mcpack` filename — see `AGENTS.md` release convention).
 
+## v1.4.3
+
+**New features**
+- Skill points: each level-up now grants 1 skill point (`lu_skill_points`) in addition to the 3 stat points. Open the SYSTEM and tap **SKILLS** to buy passive skills (Night Vision, Fire Resistance, Haste, Jump Boost, Water Breathing, Slow Falling) for 1 point each. Skills are granted as maintained effects; removing a skill refunds its point. Foreign effects from beacons/potions/`/effect` are never stripped (same ownership rules as Durability/Agility).
+- Rank / title system: level brackets E → D → C → B → A → S → SS → SSS → National Hunter. Rank is stored in `lu_rank`, shown on the SYSTEM hologram and form, and announced on the action bar when the bracket changes.
+
+**Tests**
+- 8 new tests: skill point grant, buy/remove/refund, upkeep maintenance, foreign-effect safety, rank clamping, E→D→C progression, rank-up announcement. Suite is now 44 core + 16 coverage + stale-boost isolation.
+
+## v1.4.2
+- SYSTEM form body rendered as a single line: the body was written with `\\n` (an escaped backslash), so every line break stayed literal "\n" text instead of a newline. Now real `\n`, so Level/XP, stat points, and the STR/DUR/AGI lines stack into readable paragraphs. Regression test added (`main.test.mjs` — "SYSTEM form body renders real newlines").
+
+**Docs / DX**
+- `scripts/mkzip.sh` — bash-only `.mcpack` builder used by `build-mcpack.sh` when the `zip` tool is unavailable (e.g. Termux). Emits STORED (method 0) entries with CRC-32 taken from the gzip trailer; the result is validated by `verify-pack.sh` like any other pack.
+
 ## v1.4.1
 
 **Bug fixes**

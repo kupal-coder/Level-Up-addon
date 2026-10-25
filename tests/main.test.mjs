@@ -18,6 +18,13 @@ async function advanceAsync(n) { for (let i = 0; i < n; i++) { advance(1); await
 
 const P = harness.Player;
 function newPlayer(name) { const p = new P(name); harness.players.push(p); return p; }
+// Emit `n` player-kills on one mob so we can level quickly without re-spawning.
+function killN(killer, n) {
+    const victim = killer.dimension.spawnEntity("minecraft:zombie", killer.location);
+    for (let i = 0; i < n; i++) {
+        world.afterEvents.entityDie.emit({ damageSource: { damagingEntity: killer }, deadEntity: victim });
+    }
+}
 // formLog.shown is global, so a re-open chain left running by an earlier test
 // would otherwise be counted against whoever we are asserting on.
 const formsFor = (p) => formLog.shown.filter((s) => s.player === p.id).length;
@@ -439,7 +446,138 @@ await t("spending the last point does not pop an empty form", async () => {
     formLog.respond = null;
 });
 
-// --- 10. scriptevent fallback ---
+// --- 9f. the form body must contain real line breaks ---
+// The body was written with `\\n` — an escaped backslash — so every line break
+// stayed literal "\n" text and the SYSTEM window rendered as one long line
+// with visible backslash-n's between the fields.
+await t("SYSTEM form body renders real newlines", async () => {
+    advance(120);
+    formLog.shown.length = 0;
+    const nb = newPlayer("bodyline");
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: nb });
+    await advanceAsync(15);
+    const last = formLog.shown.filter((s) => s.player === nb.id).pop();
+    assert.ok(last, "form not shown");
+    assert.ok(!last.body.includes("\\n"), "body still contains literal \\n text");
+    assert.ok(last.body.split("\n").length >= 6, "body lost its line breaks");
+    formLog.respond = null;
+});
+
+// --- 10. skills ---
+await t("level up grants 1 skill point", async () => {
+    const k = newPlayer("sklvl");
+    killN(k, 12); // 60 XP → level 2
+    advance(40);
+    assert.strictEqual(k.getDynamicProperty("lu_level"), 2, "level should be 2");
+    assert.strictEqual(k.getDynamicProperty("lu_points"), 3, "3 stat points");
+    assert.strictEqual(k.getDynamicProperty("lu_skill_points"), 1, "1 skill point");
+});
+
+await t("buying Night Vision grants the effect", async () => {
+    advance(120);
+    const sk = newPlayer("skbuy");
+    sk.setDynamicProperty("lu_skill_points", 1);
+    formLog.shown.length = 0;
+    // 1st form.show = main (tap SKILLS), 2nd = skills (buy Night Vision, index 0)
+    let shown = 0;
+    formLog.respond = () => {
+        shown++;
+        return shown === 1
+            ? { canceled: false, selection: 3 }
+            : { canceled: false, selection: 0 };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sk });
+    await advanceAsync(30);
+    assert.ok(sk.getEffect("night_vision"), "night vision not granted");
+    assert.strictEqual(sk.getDynamicProperty("lu_skill_points"), 0, "skill point not spent");
+    formLog.respond = null;
+});
+
+await t("upkeep maintains an owned skill effect", async () => {
+    advance(120);
+    const sk = newPlayer("skkeep");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    sk.setDynamicProperty("lu_skill_points", 0);
+    assert.ok(!sk.getEffect("night_vision"), "precondition: no effect yet");
+    await advanceAsync(101);
+    assert.ok(sk.getEffect("night_vision"), "owned skill effect not maintained by upkeep");
+});
+
+await t("removing an owned skill refunds the point and drops only our effect", async () => {
+    advance(120);
+    const sk = newPlayer("skrem");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    sk.setDynamicProperty("lu_skill_points", 0);
+    await advanceAsync(101);
+    assert.ok(sk.getEffect("night_vision"), "precondition: effect granted");
+    formLog.shown.length = 0;
+    // 1st = main (SKILLS), 2nd = skills (remove Night Vision, index 0),
+    // 3rd = re-open (anySpendable is true after refund) → close it.
+    let shown = 0;
+    formLog.respond = () => {
+        shown++;
+        if (shown === 1) return { canceled: false, selection: 3 };
+        if (shown === 2) return { canceled: false, selection: 0 };
+        return { canceled: true, cancelationReason: "UserClosed" };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sk });
+    await advanceAsync(30);
+    assert.ok(!sk.getEffect("night_vision"), "owned skill not removed");
+    assert.strictEqual(sk.getDynamicProperty("lu_skill_points"), 1, "point not refunded");
+    formLog.respond = null;
+});
+
+await t("upkeep never removes a night_vision from another source", async () => {
+    advance(120);
+    const f = newPlayer("skforeign");
+    f.setDynamicProperty("lu_skill_nv", 0); // we do not own it
+    f.addEffect("night_vision", 20000, { amplifier: 0 });
+    assert.ok(f.getEffect("night_vision"), "precondition: foreign effect present");
+    await advanceAsync(101);
+    assert.ok(f.getEffect("night_vision"), "foreign night_vision was stripped");
+});
+
+// --- 11. ranks ---
+await t("rank is stored and clamped on level up", async () => {
+    const k = newPlayer("rank1");
+    k.setDynamicProperty("lu_level", 100);
+    k.setDynamicProperty("lu_points", 1);
+    formLog.shown.length = 0;
+    formLog.respond = () => ({ canceled: false, selection: 0 }); // spend a stat point to trigger saveStats
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: k });
+    await advanceAsync(20);
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "National Hunter", "rank not National Hunter at level 100");
+    formLog.respond = null;
+});
+
+await t("rank advances E → D → C as the player levels", async () => {
+    const k = newPlayer("rank2");
+    killN(k, 60); // 300 XP → level 4 (E)
+    advance(40);
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "E", "rank should be E at level 4");
+    killN(k, 40); // +200 XP → level 5 (D)
+    advance(40);
+    assert.strictEqual(k.getDynamicProperty("lu_level"), 5, "should be level 5");
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "D", "rank should be D at level 5");
+    killN(k, 350); // +1750 XP → level 10 (C)
+    advance(40);
+    assert.ok(k.getDynamicProperty("lu_level") >= 10, "should be level 10+");
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "C", "rank should be C at level 10");
+});
+
+await t("rank up announcement on action bar", async () => {
+    const k = newPlayer("rankup");
+    const victim = k.dimension.spawnEntity("minecraft:zombie", k.location);
+    for (let i = 0; i < 100; i++) { // 500 XP → level 5, E → D
+        world.afterEvents.entityDie.emit({ damageSource: { damagingEntity: k }, deadEntity: victim });
+    }
+    advance(40);
+    const ab = harness.actionBars.filter((a) => a.who === k.id && a.t.includes("RANK UP"));
+    assert.ok(ab.length >= 1, "rank up not announced");
+    assert.ok(ab[0].t.includes("D"), "wrong rank announced: " + ab[0].t);
+});
+
+// --- 12. scriptevent fallback ---
 await t("/scriptevent lu:stats opens the SYSTEM", () => {
     advance(120);
     formLog.shown.length = 0;
