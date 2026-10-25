@@ -14,6 +14,10 @@ Follows semver for behavior-pack version (`LevelUp_BP/manifest.json` header `nam
 **Tests**
 - 5 new tests (58 core total), each verified to fail against the v1.4.5 script: uncapped STR, over-cap DUR boost, over-cap AGI speed, corrupt skill flag, armor-stand XP.
 
+**Release tooling**
+- `build-mcpack.sh` now builds into a temp archive and only replaces the published pack after manifest, script, and icon parity; a failed build (e.g. missing `pack_icon.png`) leaves the last good `.mcpack` untouched instead of deleting it first.
+- `verify-pack.sh` now checks `pack_icon.png` as well.
+
 ## v1.4.5
 
 **Bug fixes**
