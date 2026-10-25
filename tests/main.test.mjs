@@ -577,7 +577,94 @@ await t("rank up announcement on action bar", async () => {
     assert.ok(ab[0].t.includes("D"), "wrong rank announced: " + ab[0].t);
 });
 
-// --- 12. scriptevent fallback ---
+// --- 12. v1.4.4 bug fixes ---
+// The skill effect lasts 200 ticks and upkeep runs every 100, so it must be
+// renewed on each pass — waiting for expiry leaves it at the mercy of a late pass.
+await t("owned skill effects are renewed on every upkeep pass", async () => {
+    advance(120);
+    const sk = newPlayer("skrefresh");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    sk.setDynamicProperty("lu_agi", 1); // speed is refreshed every pass -> pass detector
+    await advanceAsync(101);
+    const firstSkill = sk.getEffect("night_vision");
+    let lastSpeed = sk.getEffect("speed");
+    assert.ok(firstSkill && lastSpeed, "precondition: maintained effects not granted");
+    // Step to the next upkeep pass (< 200 ticks after the skill's grant, because
+    // a pass happened at most 100 ticks before we captured) using speed's `until`
+    // as the "a pass ran" signal.
+    let passSeen = false;
+    for (let i = 0; i < 100; i++) {
+        await advanceAsync(1);
+        const cur = sk.getEffect("speed");
+        assert.ok(cur, "precondition: speed lapsed while waiting for a pass");
+        if (cur.until > lastSpeed.until) { passSeen = true; break; }
+    }
+    assert.ok(passSeen, "precondition: no upkeep pass observed within 100 ticks");
+    const secondSkill = sk.getEffect("night_vision");
+    assert.ok(secondSkill, "skill effect lapsed on the next upkeep pass");
+    assert.ok(secondSkill.until > firstSkill.until,
+        `effect not renewed (until ${secondSkill.until} vs ${firstSkill.until}) — a late upkeep pass would let it blink out`);
+});
+
+await t("a stat tap with only skill points left opens the SKILLS menu", async () => {
+    advance(120);
+    const z = newPlayer("skstrand");
+    z.setDynamicProperty("lu_points", 0);
+    z.setDynamicProperty("lu_skill_points", 1);
+    formLog.shown.length = 0;
+    let shown = 0;
+    formLog.respond = () => {
+        shown += 1;
+        if (shown === 1) return { canceled: false, selection: 0 }; // tap STR with no stat points
+        return { canceled: true, cancelationReason: "UserClosed" };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
+    await advanceAsync(40);
+    assert.ok(formsFor(z) >= 2, "skill point stranded: the form closed on 'No stat points'");
+    formLog.respond = null;
+});
+
+await t("level up announcement mentions the skill point", async () => {
+    advance(120);
+    const k = newPlayer("skmsg");
+    harness.messages.length = 0;
+    killN(k, 12); // 60 XP -> level 2
+    advance(40);
+    const msgs = harness.messages.filter((m) => m.who === k.id).map((m) => m.t);
+    assert.ok(msgs.some((t) => /skill/i.test(t)), "level-up message never mentions skill points");
+});
+
+await t("rank up is also announced in chat, not just the action bar", async () => {
+    advance(120);
+    const k = newPlayer("rankmsg");
+    harness.messages.length = 0;
+    killN(k, 100); // 500 XP -> level 5, E -> D
+    advance(40);
+    const msgs = harness.messages.filter((m) => m.who === k.id).map((m) => m.t);
+    assert.ok(msgs.some((t) => t.includes("RANK UP")),
+        "rank up never reached chat (ARISE overwrites the action bar 12 ticks later)");
+});
+
+await t("a locked skill does not close the menu while a skill can still be removed", async () => {
+    advance(120);
+    const z = newPlayer("sklocked");
+    z.setDynamicProperty("lu_skill_points", 0);
+    z.setDynamicProperty("lu_skill_nv", 1);
+    formLog.shown.length = 0;
+    let shown = 0;
+    formLog.respond = () => {
+        shown += 1;
+        if (shown === 1) return { canceled: false, selection: 3 }; // SYSTEM -> SKILLS
+        if (shown === 2) return { canceled: false, selection: 1 }; // tap locked Fire Resistance
+        return { canceled: true, cancelationReason: "UserClosed" };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
+    await advanceAsync(50);
+    assert.ok(formsFor(z) >= 3, "skills menu closed even though an owned skill could be removed");
+    formLog.respond = null;
+});
+
+// --- 13. scriptevent fallback ---
 await t("/scriptevent lu:stats opens the SYSTEM", () => {
     advance(120);
     formLog.shown.length = 0;

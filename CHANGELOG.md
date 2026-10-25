@@ -2,6 +2,19 @@
 
 Follows semver for behavior-pack version (`LevelUp_BP/manifest.json` header `name` + `version` + `LevelUp_vX.Y.Z.mcpack` filename — see `AGENTS.md` release convention).
 
+## v1.4.4
+
+**Bug fixes**
+- Skill effects were only re-granted once they had *expired* (`cur.amplifier !== mine`); unlike Agility/Durability there was no refresh when the amplifier already matched. Renew every upkeep pass, while still leaving a strictly stronger foreign effect (beacon Haste II, `/effect`) alone. Regression test asserts the effect's remaining duration grows on the next pass instead of resetting only after a lapse.
+- Tapping a stat with 0 stat points but unspent skill points closed the form and stranded the skill point until the player redid the gesture. The "No stat points" path now routes straight to the **SKILLS** menu when a skill is still affordable, and says so in the message.
+- Level-up announcements (cinematic hologram, title subtitle, chat line) only mentioned stat points; the 1 skill point per level was granted silently. All three now report both.
+- The `RANK UP` action bar was replaced by the `A R I S E` flash 12 ticks later. Rank-up is now also sent to chat so it is not lost.
+- Tapping a locked skill with 0 points closed the **SKILLS** menu even when an owned skill could still be removed (refund). It now re-opens while any skills action is available (`skillsChangeable`).
+- **SKILLS** body now lists every skill and its effect, instead of an empty-looking "tap a skill" line, and the status hologram refreshes after a buy/remove.
+
+**Tests**
+- 5 new tests (49 core total), each verified to fail against the v1.4.3 script.
+
 ## v1.4.3
 
 **New features**

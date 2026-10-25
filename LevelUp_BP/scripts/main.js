@@ -115,6 +115,13 @@ function saveStats(player, s) {
     } catch { /* player left mid-write */ }
 }
 
+// Can the player still do anything in the SKILLS menu? Buying needs a point and
+// an unowned skill; removing an owned skill always works (it refunds the point).
+function skillsChangeable(s) {
+    return SKILLS.some((sk) => s[`skill_${sk.key}`] === 1) ||
+        (s.skillPoints > 0 && SKILLS.some((sk) => !s[`skill_${sk.key}`]));
+}
+
 // Highest value of `key` that still changes something. Agility saturates early;
 // Durability saturates at DUR_CAP (same 120 max HP as the old 50x2 model);
 // Strength scales all the way to MAX_STAT.
@@ -298,11 +305,14 @@ function applySkills(player) {
             try {
                 const cur = player.getEffect(sk.effect);
                 if (owned) {
-                    const mine = num(player.getDynamicProperty(ampProp), -1);
-                    if (cur === undefined || cur.amplifier !== mine) {
-                        player.addEffect(sk.effect, 200, { amplifier: sk.amp, showParticles: false });
-                        player.setDynamicProperty(ampProp, sk.amp);
-                    }
+                    // Leave a strictly stronger foreign effect (beacon Haste II,
+                    // /effect) alone, but equality — ours OR a same-strength one —
+                    // must still be refreshed every pass. Skipping the renewal let
+                    // the 200-tick effect run out before the 100-tick upkeep pass
+                    // re-granted it, exactly the blink-out applyAgility avoids.
+                    if (cur !== undefined && cur.amplifier > sk.amp) continue;
+                    player.addEffect(sk.effect, 200, { amplifier: sk.amp, showParticles: false });
+                    player.setDynamicProperty(ampProp, sk.amp);
                 } else {
                     const mine = num(player.getDynamicProperty(ampProp), -1);
                     if (cur !== undefined && mine >= 0 && cur.amplifier === mine) {
@@ -575,13 +585,13 @@ system.runInterval(() => {
 }, 5);
 
 // ---- LEVEL UP cinematic (~2.5s): shake + fade + spiral + ARISE + title ----
-function levelUpCinematic(player, level, pointsGained) {
+function levelUpCinematic(player, level, pointsGained, skillPointsGained = 0) {
     safeCommand(player, `camerashake add @s 0.35 1.2 rotational`);
     safeCommand(player, `camera @s fade time 0.2 1.0 0.6 color 12 4 32`);
     safeSound(player, "mob.enderdragon.growl", { pitch: 0.5, volume: 0.8 });
     ringBurst(player, 10 + pointsGained * 2);
     spiralUp(player, 20 + pointsGained * 4);
-    try { showHologram(player, ["§l§eLEVEL UP", `§fLevel ${level}`, `§e+${pointsGained} stat points`], 160); } catch { /* cosmetic */ }
+    try { showHologram(player, ["§l§eLEVEL UP", `§fLevel ${level}`, `§e+${pointsGained} stat points`, `§e+${skillPointsGained} skill points`], 160); } catch { /* cosmetic */ }
 
     system.runTimeout(() => {
         try {
@@ -596,7 +606,7 @@ function levelUpCinematic(player, level, pointsGained) {
             if (!player.isValid) return;
             try {
                 player.onScreenDisplay.setTitle("§l§eLEVEL UP!", {
-                    subtitle: `§7Level ${level}  •  §e+${pointsGained} stat points`,
+                    subtitle: `§7Level ${level}  •  §e+${pointsGained} stat pts  •  §c+${skillPointsGained} skill pts`,
                     fadeInDuration: 5, stayDuration: 45, fadeOutDuration: 12,
                 });
             } catch { /* HUD unavailable */ }
@@ -647,8 +657,14 @@ function openSystem(player, retry = 1) {
         }
         const st = loadStats(player);
         if (st.points <= 0) {
-            tell(player, "§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
+            const canBuySkill = st.skillPoints > 0 && SKILLS.some((sk) => !st[`skill_${sk.key}`]);
+            tell(player, canBuySkill
+                ? "§b[SYSTEM] §7No stat points — but you still have skill points to spend."
+                : "§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
             safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
+            // Skill points live in a different menu. Closing here stranded them
+            // until the player redid the whole gesture.
+            if (canBuySkill) system.runTimeout(() => openSystemSkills(player, 1), 10);
             return;
         }
         const key = res.selection === 0 ? "str" : res.selection === 1 ? "dur" : "agi";
@@ -694,7 +710,8 @@ function openSystemSkills(player, retry = 1) {
         .title("§l§bS Y S T E M — SKILLS")
         .body(
             `§7Skill points: §e${s.skillPoints}\n\n` +
-            `§7Tap a skill to buy (1 pt) or remove (refund 1 pt).\n`
+            SKILLS.map((sk) => `§8${s[`skill_${sk.key}`] === 1 ? "§a✔" : "•"} §f${sk.name}§8 — ${sk.desc}`).join("\n") +
+            `\n\n§7Tap a skill to buy (1 pt) or remove (refund 1 pt).`
         );
     for (const sk of SKILLS) {
         const owned = s[`skill_${sk.key}`] === 1;
@@ -720,7 +737,9 @@ function openSystemSkills(player, retry = 1) {
             if (st.skillPoints <= 0) {
                 tell(player, "§b[SYSTEM] §7No skill points. Level up to earn more.");
                 safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
-                if (anySpendable(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
+                // The player may still remove an owned skill for a refund; closing
+                // the menu here would hide that action until they reopened it.
+                if (skillsChangeable(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
                 return;
             }
             st[`skill_${sk.key}`] = 1;
@@ -730,6 +749,9 @@ function openSystemSkills(player, retry = 1) {
         applySkills(player);
         tell(player, `§b[SYSTEM] §7${sk.name} §f${owned ? "removed" : "learned"}.`);
         safeSound(player, "random.orb", { pitch: owned ? 0.6 : 1.2, volume: 0.8 });
+        try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
+        // Re-open only while there is something left to do, so the last action
+        // does not pop an empty-looking menu the player has to Close.
         if (anySpendable(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
     }).catch(() => { /* player offline / in another UI */ });
 }
@@ -949,12 +971,17 @@ world.afterEvents.entityDie.subscribe((ev) => {
         s.rank = rankOf(s.level).name;
         saveStats(killer, s);
         if (ups > 0) {
-            levelUpCinematic(killer, s.level, ups * POINTS_PER_LEVEL);
-            tell(killer, `§b[SYSTEM] §7Level §f${s.level}§7! Sneak + double-jump to open your status.`);
+            const gainedStat = ups * POINTS_PER_LEVEL;
+            const gainedSkill = ups * SKILL_POINTS_PER_LEVEL;
+            levelUpCinematic(killer, s.level, gainedStat, gainedSkill);
+            tell(killer, `§b[SYSTEM] §7Level §f${s.level}§7! §e+${gainedStat} stat §7and §c+${gainedSkill} skill §7points. Sneak + double-jump to spend them.`);
             // Rank up announcement — only when the rank bracket actually changes.
             const oldRank = rankOf(oldLevel).name;
             if (s.rank !== oldRank) {
                 setActionBar(killer, `§d§lRANK UP: ${s.rank}`);
+                // The ARISE action bar replaces this one 12 ticks later, so the
+                // headline also goes to chat where it is not stamped over.
+                tell(killer, `§d§lRANK UP: §f${s.rank}`);
                 safeSound(killer, "block.beacon.activate", { pitch: 1.4, volume: 0.8 });
             }
         } else {

@@ -23,6 +23,27 @@ Killing mobs grants XP (stronger mobs = more XP, capped at 20 XP per kill). Each
 
 > Max HP can't be written directly by the Script API, so Durability is granted with a maintained `health_boost` effect, which only moves in **4 HP steps**. Each Durability point therefore buys exactly one step (+4 max HP, up to 120 at DUR 25), so no point is ever a no-op. The SYSTEM window shows the real number (foreign `health_boost` effects from `/effect` or another addon are ignored in the display).
 
+## Skills & ranks
+
+Every level-up also grants **1 skill point**, kept separate from stat points. Open the SYSTEM and tap **SKILLS** to buy or remove a passive skill for 1 point each (removing refunds it):
+
+| Skill | Effect |
+|---|---|
+| Night Vision | See in the dark |
+| Fire Resistance | Immune to fire and lava |
+| Haste | Mine and attack faster |
+| Jump Boost | Jump higher |
+| Water Breathing | Breathe underwater |
+| Slow Falling | Fall without taking damage |
+
+Skills are maintained effects with the same ownership rule as Durability/Agility: an effect from a beacon, potion, `/effect`, or another addon is never stripped, and a stronger version is never downgraded.
+
+Levels also carry a **rank / title** shown on the SYSTEM window and floating board, with a chat + action-bar announcement when the bracket changes:
+
+| Rank | E | D | C | B | A | S | SS | SSS | National Hunter |
+|---|---|---|---|---|---|---|---|---|---|
+| Level | 1 | 5 | 10 | 20 | 30 | 50 | 70 | 85 | 100 |
+
 ## Cinematic touches
 
 - **Level up:** screen shake + dark fade, rising particle spiral, deep growl → *✦ ARISE ✦* → LEVEL UP title with fanfare.
@@ -36,12 +57,12 @@ Killing mobs grants XP (stronger mobs = more XP, capped at 20 XP per kill). Each
 ## Install
 
 1. Copy `LevelUp_BP` to your `development_behavior_packs` folder (or zip it as `.mcpack`).
-2. New world → Behavior Packs → activate **Level Up** v1.4.3. No experiments required.
+2. New world → Behavior Packs → activate **Level Up** v1.4.4. No experiments required.
 3. Kill mobs, then sneak + double-jump to spend points.
 
 Requires Minecraft Bedrock **1.21.90+** (`min_engine_version` [1,21,90], stable `@minecraft/server` 2.0.0). Using an older engine advertises an API the engine can't provide — the addon will fail to load.
 
-**From a zip:** Import `LevelUp_v1.4.3.mcpack` directly — Minecraft installs `LevelUp_BP` for you.
+**From a zip:** Import `LevelUp_v1.4.4.mcpack` directly — Minecraft installs `LevelUp_BP` for you.
 
 **Updating:** Deactivate the old pack, import the new `.mcpack`, re-activate. Your level/stats live in dynamic properties and survive updates. Downgrading across a cap change (e.g. DUR 25) auto-refunds excess as points.
 
@@ -58,7 +79,7 @@ Requires Minecraft Bedrock **1.21.90+** (`min_engine_version` [1,21,90], stable 
 
 ## For contributors
 
-- `npm test` — 44 core + `stale-boost` isolation test (see `tests/`).
+- `npm test` — 49 core + `stale-boost` isolation test (see `tests/`).
 - `node tests/coverage.test.mjs` — 16 extra regression checks (dismiss, cooldown, portal, aura, MAX_LEVEL, boss XP cap, etc.).
 - `npm run check` — syntax + manifest JSON check.
 - `npm pack @minecraft/server@2.0.0 && npx tsc --allowJs --checkJs --noEmit` — type-check against real Bedrock types.
@@ -71,7 +92,8 @@ All balance numbers live at the top of `LevelUp_BP/scripts/main.js`:
 
 | Knob | Default | Notes |
 |---|---|---|
-| `POINTS_PER_LEVEL` | `3` | per level-up |
+| `POINTS_PER_LEVEL` | `3` | stat points per level-up |
+| `SKILL_POINTS_PER_LEVEL` | `1` | skill points per level-up |
 | `STR_DMG_PER_POINT` | `0.5` | bonus melee dmg |
 | `HP_PER_DUR` | `4` | must be multiple of 4 (health_boost granularity) |
 | `MAX_STAT` | `50` | STR cap |
