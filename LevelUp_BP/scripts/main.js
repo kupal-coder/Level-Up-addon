@@ -25,6 +25,43 @@ const AGI_CAP = 5;
 const DUR_CAP = 25;
 const AURA_MIN_LEVEL = 5; // level at which players get an idle wisp aura
 const MAX_LEVEL = 100; // hard cap — prevents unbounded while loop / point inflation on corrupt saves
+const SKILL_POINTS_PER_LEVEL = 1; // one skill point per level-up, separate from stat points
+
+// Skills are binary (owned / not owned), cost 1 skill point each, and are granted
+// as maintained effects like Durability's health_boost and Agility's speed — but
+// every skill is amplifier 0, so an amplifier record cannot prove who granted it.
+// Two consequences, both deliberate:
+//  - while owned, the effect is topped up every pass, which replaces the remaining
+//    duration of a same-strength potion (a stronger effect is still left alone);
+//  - removing a skill never calls removeEffect — that could strip a real potion
+//    we cannot tell apart. The effect is simply left to expire (<= 400 ticks).
+const SKILL_EFFECT_TICKS = 400; // > the ~10s Night Vision flicker threshold
+const SKILL_MIGRATION_PROP = "lu_skill_migrated"; // set once level-1 points are back-filled
+const SKILLS = [
+    { key: "nv", name: "Night Vision", effect: "night_vision", amp: 0, desc: "See in the dark" },
+    { key: "fr", name: "Fire Resistance", effect: "fire_resistance", amp: 0, desc: "Immune to fire and lava" },
+    { key: "haste", name: "Haste", effect: "haste", amp: 0, desc: "Mine and attack faster" },
+    { key: "jump", name: "Jump Boost", effect: "jump_boost", amp: 0, desc: "Jump higher" },
+    { key: "wb", name: "Water Breathing", effect: "water_breathing", amp: 0, desc: "Breathe underwater" },
+    { key: "sf", name: "Slow Falling", effect: "slow_falling", amp: 0, desc: "Fall without taking damage" },
+];
+
+// Rank thresholds by level. The highest matching threshold wins.
+const RANKS = [
+    { level: 100, name: "National Hunter", color: "§c§l" },
+    { level: 85, name: "SSS", color: "§d§l" },
+    { level: 70, name: "SS", color: "§b§l" },
+    { level: 50, name: "S", color: "§a§l" },
+    { level: 30, name: "A", color: "§2" },
+    { level: 20, name: "B", color: "§3" },
+    { level: 10, name: "C", color: "§9" },
+    { level: 5, name: "D", color: "§6" },
+    { level: 1, name: "E", color: "§7" },
+];
+function rankOf(level) {
+    for (const r of RANKS) if (level >= r.level) return r;
+    return RANKS[RANKS.length - 1];
+}
 
 const xpNext = (level) => level * 50;
 
@@ -40,9 +77,17 @@ function loadStats(player) {
         str: num(player.getDynamicProperty("lu_str")),
         dur: num(player.getDynamicProperty("lu_dur")),
         agi: num(player.getDynamicProperty("lu_agi")),
+        skillPoints: num(player.getDynamicProperty("lu_skill_points")),
     };
+    for (const sk of SKILLS) {
+        // Normalize corrupted/legacy flags to 0/1. A value like 2 used to fail
+        // every `=== 1` check: the skill was invisible in the menu, impossible
+        // to remove (no refund), and never applied.
+        s[`skill_${sk.key}`] = num(player.getDynamicProperty(`lu_skill_${sk.key}`)) ? 1 : 0;
+    }
     if (s.level < 1) s.level = 1;
     if (s.level > MAX_LEVEL) s.level = MAX_LEVEL;
+    s.rank = rankOf(s.level).name;
     // Cap XP at max level so a corrupt 1e9 XP can't freeze the level-up loop.
     if (s.level >= MAX_LEVEL) {
         const cap = xpNext(s.level);
@@ -54,6 +99,19 @@ function loadStats(player) {
     if (s.str > MAX_STAT) { s.points += s.str - MAX_STAT; s.str = MAX_STAT; }
     if (s.dur > DUR_CAP) { s.points += s.dur - DUR_CAP; s.dur = DUR_CAP; }
     if (s.agi > AGI_CAP) { s.points += s.agi - AGI_CAP; s.agi = AGI_CAP; }
+    // One-time back-fill for saves created before skill points existed: every
+    // level above 1 should have granted one, so pay out level-1 once. Written
+    // here (not in saveStats) so a player who never opens a form still gets it
+    // on the next upkeep pass. The marker makes it idempotent — including for
+    // players who already earned points after v1.4.3 (they get a small bonus
+    // rather than the migration silently skipping older worlds).
+    if (player.getDynamicProperty(SKILL_MIGRATION_PROP) !== 1) {
+        try {
+            s.skillPoints += Math.max(0, s.level - 1);
+            player.setDynamicProperty("lu_skill_points", s.skillPoints);
+            player.setDynamicProperty(SKILL_MIGRATION_PROP, 1);
+        } catch { /* player left mid-read */ }
+    }
     return s;
 }
 
@@ -72,7 +130,32 @@ function saveStats(player, s) {
         player.setDynamicProperty("lu_str", s.str);
         player.setDynamicProperty("lu_dur", s.dur);
         player.setDynamicProperty("lu_agi", s.agi);
+        player.setDynamicProperty("lu_skill_points", s.skillPoints);
+        for (const sk of SKILLS) {
+            player.setDynamicProperty(`lu_skill_${sk.key}`, s[`skill_${sk.key}`]);
+        }
+        player.setDynamicProperty("lu_rank", s.rank);
     } catch { /* player left mid-write */ }
+}
+
+// Can the player buy another skill? This is the only SKILLS action that spends a
+// point; removal is a separate (always available) action.
+function canBuySkill(s) {
+    return s.skillPoints > 0 && SKILLS.some((sk) => !s[`skill_${sk.key}`]);
+}
+
+// Is there still a reason to keep the SKILLS menu open? Buying or removing.
+// Deliberately blind to stat points — those belong to the SYSTEM menu.
+function skillsChangeable(s) {
+    return canBuySkill(s) || SKILLS.some((sk) => s[`skill_${sk.key}`] === 1);
+}
+
+// Is there anywhere left to put a *stat* point? Skill points live in a different
+// menu, so they must never keep the SYSTEM form open (or re-open it) after the
+// last stat point is spent.
+function statsSpendable(s) {
+    return s.points > 0 &&
+        (s.str < statCap("str") || s.dur < statCap("dur") || s.agi < statCap("agi"));
 }
 
 // Highest value of `key` that still changes something. Agility saturates early;
@@ -84,14 +167,10 @@ function statCap(key) {
     return MAX_STAT;
 }
 
-// Is there anywhere left to put a point? A re-open is only worth it if the player
-// has an unspent point AND a stat that will take it. When everything is capped
-// there is nothing to strand, and re-opening anyway traps them: every tap just
-// re-opened the form, so Close was the only way out.
-function anySpendable(s) {
-    return s.points > 0 &&
-        (s.str < statCap("str") || s.dur < statCap("dur") || s.agi < statCap("agi"));
-}
+// A stat re-open is only worth it if the player has an unspent point AND a stat
+// that will take it. When everything is capped there is nothing to strand, and
+// re-opening anyway trapped them: every tap just re-opened the form, so Close was
+// the only way out. (Skill points are handled by canBuySkill/skillsChangeable.)
 
 // ---- DUR -> max HP ----
 // On @minecraft/server 2.0.0 every EntityAttributeComponent member is read-only:
@@ -195,7 +274,13 @@ function applyDurability(player, heal = 0) {
         const wantAmp = healthBoostAmplifier(s.dur);
         try {
             const cur = player.getEffect("health_boost");
-            if (cur === undefined || cur.amplifier <= wantAmp) {
+            const mine = num(player.getDynamicProperty(BOOST_AMP_PROP), -1);
+            // A matching recorded amplifier proves the effect is ours even when it
+            // is *stronger* than wantAmp. Over-cap DUR is clamped on load, and
+            // treating our old, taller boost as foreign kept the inflated max HP
+            // forever while the excess was refunded as points.
+            const ours = cur !== undefined && mine >= 0 && cur.amplifier === mine;
+            if (cur === undefined || ours || cur.amplifier <= wantAmp) {
                 player.addEffect("health_boost", 200, { amplifier: wantAmp, showParticles: false });
                 player.setDynamicProperty(BOOST_AMP_PROP, wantAmp);
             }
@@ -235,13 +320,36 @@ function applyAgility(player) {
         const want = agiAmplifier(agi);
         // A beacon pyramid or a potion grants speed too, and addEffect "adds or
         // updates" — so writing unconditionally downgraded a stronger speed to ours
-        // every upkeep pass. Leave a strictly stronger effect alone; equality still
-        // refreshes our duration, which is what stops the effect blinking out.
+        // every upkeep pass. Leave a strictly stronger *foreign* effect alone;
+        // equality still refreshes our duration, which is what stops the effect
+        // blinking out. Our own recorded amplifier is allowed to shrink when an
+        // over-cap AGI is clamped on load, or the old Speed tier would stick.
         const cur = player.getEffect("speed");
-        if (cur !== undefined && cur.amplifier > want) return;
+        const mine = num(player.getDynamicProperty(SPEED_AMP_PROP), -1);
+        const ours = cur !== undefined && mine >= 0 && cur.amplifier === mine;
+        if (cur !== undefined && cur.amplifier > want && !ours) return;
         player.addEffect("speed", 200, { amplifier: want, showParticles: false });
         try { player.setDynamicProperty(SPEED_AMP_PROP, want); } catch { /* ignore */ }
     } catch { /* effect unavailable */ }
+}
+
+// Grant or top up each owned skill as a maintained effect. Amplifier 0 is
+// indistinguishable from a potion's, so removal deliberately does nothing: the
+// unused effect expires on its own instead of risking a real potion being
+// stripped. A strictly stronger foreign effect (beacon Haste II, /effect) is
+// never downgraded; equality is refreshed so ours cannot lapse between passes.
+function applySkills(player) {
+    try {
+        const s = loadStats(player);
+        for (const sk of SKILLS) {
+            if (s[`skill_${sk.key}`] !== 1) continue; // not owned -> let it expire
+            try {
+                const cur = player.getEffect(sk.effect);
+                if (cur !== undefined && cur.amplifier > sk.amp) continue;
+                player.addEffect(sk.effect, SKILL_EFFECT_TICKS, { amplifier: sk.amp, showParticles: false });
+            } catch { /* effect unavailable */ }
+        }
+    } catch { /* ignore */ }
 }
 
 // ============================================================
@@ -450,8 +558,8 @@ function dismissHologram(player) {
 
 function statusHoloLines(s) {
     return [
-        "§l§bS Y S T E M",
-        `§fLv ${s.level} §8• §e${s.points} stat points`,
+        `§f[${s.rank}] §l§bS Y S T E M`,
+        `§fLv ${s.level} §8• §e${s.points} stat points §7• §e${s.skillPoints} skill points`,
         `§cSTR ${s.str} §8• §aDUR ${s.dur} §8• §bAGI ${s.agi}`,
         "§7defeat mobs to level up",
     ];
@@ -504,13 +612,13 @@ system.runInterval(() => {
 }, 5);
 
 // ---- LEVEL UP cinematic (~2.5s): shake + fade + spiral + ARISE + title ----
-function levelUpCinematic(player, level, pointsGained) {
+function levelUpCinematic(player, level, pointsGained, skillPointsGained = 0) {
     safeCommand(player, `camerashake add @s 0.35 1.2 rotational`);
     safeCommand(player, `camera @s fade time 0.2 1.0 0.6 color 12 4 32`);
     safeSound(player, "mob.enderdragon.growl", { pitch: 0.5, volume: 0.8 });
     ringBurst(player, 10 + pointsGained * 2);
     spiralUp(player, 20 + pointsGained * 4);
-    try { showHologram(player, ["§l§eLEVEL UP", `§fLevel ${level}`, `§e+${pointsGained} stat points`], 160); } catch { /* cosmetic */ }
+    try { showHologram(player, ["§l§eLEVEL UP", `§fLevel ${level}`, `§e+${pointsGained} stat points`, `§e+${skillPointsGained} skill points`], 160); } catch { /* cosmetic */ }
 
     system.runTimeout(() => {
         try {
@@ -525,7 +633,7 @@ function levelUpCinematic(player, level, pointsGained) {
             if (!player.isValid) return;
             try {
                 player.onScreenDisplay.setTitle("§l§eLEVEL UP!", {
-                    subtitle: `§7Level ${level}  •  §e+${pointsGained} stat points`,
+                    subtitle: `§7Level ${level}  •  §e+${pointsGained} stat pts  •  §c+${skillPointsGained} skill pts`,
                     fadeInDuration: 5, stayDuration: 45, fadeOutDuration: 12,
                 });
             } catch { /* HUD unavailable */ }
@@ -548,16 +656,17 @@ function openSystem(player, retry = 1) {
     const form = new ActionFormData()
         .title("§l§bS Y S T E M")
         .body(
-            `§7Level: §f${s.level}  §8(${s.xp}/${need} XP)\\n` +
-            `§7Stat points: §e${s.points}\\n\\n` +
-            `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg${s.str >= statCap("str") ? " (max)" : ""})\\n` +
-            `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP${s.dur >= statCap("dur") ? " (max)" : ""})\\n` +
-            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"}${s.agi >= statCap("agi") ? " (max)" : ""})\\n\\n` +
+            `§7Rank: §f${s.rank} §8(Level ${s.level} • ${s.xp}/${need} XP)\n` +
+            `§7Stat points: §e${s.points}  §7Skill points: §e${s.skillPoints}\n\n` +
+            `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg${s.str >= statCap("str") ? " (max)" : ""})\n` +
+            `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP${s.dur >= statCap("dur") ? " (max)" : ""})\n` +
+            `§b➶ Agility: §f${s.agi} §8(${s.agi > 0 ? "Speed " + (agiAmplifier(s.agi) + 1) : "no bonus"}${s.agi >= statCap("agi") ? " (max)" : ""})\n\n` +
             `§8Tap a stat to spend 1 point.`
         )
         .button("§c⚔ Strength +1")
         .button("§a❤ Durability +1")
         .button("§b➶ Agility +1")
+        .button("§eSKILLS")
         .button("§8Close");
 
     form.show(player).then((res) => {
@@ -568,11 +677,21 @@ function openSystem(player, retry = 1) {
             }
             return;
         }
-        if (res.selection === 3 || res.selection === undefined) return; // Close
+        if (res.selection === 4 || res.selection === undefined) return; // Close
+        if (res.selection === 3) {
+            system.runTimeout(() => openSystemSkills(player, 1), 10);
+            return;
+        }
         const st = loadStats(player);
         if (st.points <= 0) {
-            tell(player, "§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
+            const hasSkillPoint = canBuySkill(st);
+            tell(player, hasSkillPoint
+                ? "§b[SYSTEM] §7No stat points — but you still have skill points to spend."
+                : "§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
             safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
+            // Skill points live in a different menu. Closing here stranded them
+            // until the player redid the whole gesture.
+            if (hasSkillPoint) system.runTimeout(() => openSystemSkills(player, 1), 10);
             return;
         }
         const key = res.selection === 0 ? "str" : res.selection === 1 ? "dur" : "agi";
@@ -583,7 +702,9 @@ function openSystem(player, retry = 1) {
             // Re-open only if the points are still theirs to spend somewhere else.
             // Returning here without a form would strand them, but re-opening when
             // nothing is spendable just traps them in a form they cannot tap out of.
-            if (anySpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
+            // If only skill points are left, hand them to the SKILLS menu instead.
+            if (statsSpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
+            else if (canBuySkill(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
             return;
         }
         st[key] += 1;
@@ -597,10 +718,70 @@ function openSystem(player, retry = 1) {
         setActionBar(player, `§e${names[key]} §7→ §f${st[key]}`);
         tell(player, `§b[SYSTEM] §f${names[key]} §7→ §f${st[key]} §8(${st.points} points left)`);
         try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
-        // Re-open so points can be spent in a row (only while something is still
-        // spendable — otherwise the last spend pops an empty form). 10 ticks:
+        // Re-open so points can be spent in a row (only while a *stat* point is
+        // still spendable — otherwise the last spend pops an empty form). 10 ticks:
         // reopening too fast lands while the old form is still closing (UserBusy).
-        if (anySpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
+        if (statsSpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
+    }).catch(() => { /* player offline / in another UI */ });
+}
+
+// ---- SKILLS window ----
+// Buy a skill for 1 skill point, or remove an owned skill to refund the point.
+// applySkills() maintains the effects; see its comment for the (deliberately
+// conservative) ownership rule at amplifier 0.
+function openSystemSkills(player, retry = 1) {
+    let s;
+    try {
+        if (!player.isValid) return;
+        s = loadStats(player);
+    } catch { return; }
+    const form = new ActionFormData()
+        .title("§l§bS Y S T E M — SKILLS")
+        .body(
+            `§7Skill points: §e${s.skillPoints}\n\n` +
+            SKILLS.map((sk) => `§8${s[`skill_${sk.key}`] === 1 ? "§a✔" : "•"} §f${sk.name}§8 — ${sk.desc}`).join("\n") +
+            `\n\n§7Tap a skill to buy (1 pt) or remove (refund 1 pt).`
+        );
+    for (const sk of SKILLS) {
+        const owned = s[`skill_${sk.key}`] === 1;
+        form.button(owned ? `§a✔ ${sk.name}` : `§e+ ${sk.name} §7(1 pt)`);
+    }
+    form.button("§8Close");
+
+    form.show(player).then((res) => {
+        if (res.canceled) {
+            if (res.cancelationReason === "UserBusy" && retry > 0) {
+                system.runTimeout(() => openSystemSkills(player, retry - 1), 20);
+            }
+            return;
+        }
+        if (res.selection === SKILLS.length || res.selection === undefined) return; // Close
+        const sk = SKILLS[res.selection];
+        const st = loadStats(player);
+        const owned = st[`skill_${sk.key}`] === 1;
+        if (owned) {
+            st[`skill_${sk.key}`] = 0;
+            st.skillPoints += 1;
+        } else {
+            if (st.skillPoints <= 0) {
+                tell(player, "§b[SYSTEM] §7No skill points. Level up to earn more.");
+                safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
+                // The player may still remove an owned skill for a refund; closing
+                // the menu here would hide that action until they reopened it.
+                if (skillsChangeable(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
+                return;
+            }
+            st[`skill_${sk.key}`] = 1;
+            st.skillPoints -= 1;
+        }
+        saveStats(player, st);
+        applySkills(player);
+        tell(player, `§b[SYSTEM] §7${sk.name} §f${owned ? "removed" : "learned"}.`);
+        safeSound(player, "random.orb", { pitch: owned ? 0.6 : 1.2, volume: 0.8 });
+        try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
+        // Re-open only while a skills action is left — stat points live in the
+        // SYSTEM menu and must not keep this one alive.
+        if (skillsChangeable(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
     }).catch(() => { /* player offline / in another UI */ });
 }
 
@@ -782,12 +963,32 @@ try {
 } catch { /* ignore */ }
 
 // ---- XP from kills -> level ups -> stat points ----
+// Destroyable entities that are not mobs. Awarding XP for these turned armor
+// stands (20 HP, instantly replaceable) into a free XP farm and also paid for
+// breaking boats/minecarts/paintings. Players themselves are handled separately.
+const NON_MOB_VICTIMS = new Set([
+    "minecraft:armor_stand",
+    "minecraft:boat",
+    "minecraft:chest_boat",
+    "minecraft:minecart",
+    "minecraft:chest_minecart",
+    "minecraft:hopper_minecart",
+    "minecraft:tnt_minecart",
+    "minecraft:furnace_minecart",
+    "minecraft:command_block_minecart",
+    "minecraft:spawner_minecart",
+    "minecraft:item_frame",
+    "minecraft:glow_item_frame",
+    "minecraft:painting",
+]);
+
 world.afterEvents.entityDie.subscribe((ev) => {
     try {
         const killer = ev.damageSource?.damagingEntity;
         if (!killer || killer.typeId !== "minecraft:player") return;
         const victim = ev.deadEntity;
         if (!victim || victim.typeId === "minecraft:player") return;
+        if (NON_MOB_VICTIMS.has(victim.typeId)) return;
         let maxHp = 20;
         try { maxHp = victim.getComponent("health")?.effectiveMax ?? 20; } catch { /* default */ }
         const gain = Math.max(2, Math.min(20, Math.ceil(maxHp / 4)));
@@ -800,11 +1001,13 @@ world.afterEvents.entityDie.subscribe((ev) => {
         }
         s.xp += gain;
         let ups = 0;
+        const oldLevel = s.level;
         // Guarded by MAX_LEVEL — prevents freeze on corrupt 1e9 XP.
         while (s.xp >= xpNext(s.level) && s.level < MAX_LEVEL) {
             s.xp -= xpNext(s.level);
             s.level += 1;
             s.points += POINTS_PER_LEVEL;
+            s.skillPoints += SKILL_POINTS_PER_LEVEL;
             ups += 1;
             // Extra safety: if something else corrupted xpNext, break after 200 ups
             if (ups > 200) break;
@@ -814,10 +1017,22 @@ world.afterEvents.entityDie.subscribe((ev) => {
             const cap = xpNext(s.level);
             if (s.xp >= cap) s.xp = cap - 1;
         }
+        s.rank = rankOf(s.level).name;
         saveStats(killer, s);
         if (ups > 0) {
-            levelUpCinematic(killer, s.level, ups * POINTS_PER_LEVEL);
-            tell(killer, `§b[SYSTEM] §7Level §f${s.level}§7! Sneak + double-jump to open your status.`);
+            const gainedStat = ups * POINTS_PER_LEVEL;
+            const gainedSkill = ups * SKILL_POINTS_PER_LEVEL;
+            levelUpCinematic(killer, s.level, gainedStat, gainedSkill);
+            tell(killer, `§b[SYSTEM] §7Level §f${s.level}§7! §e+${gainedStat} stat §7and §c+${gainedSkill} skill §7points. Sneak + double-jump to spend them.`);
+            // Rank up announcement — only when the rank bracket actually changes.
+            const oldRank = rankOf(oldLevel).name;
+            if (s.rank !== oldRank) {
+                setActionBar(killer, `§d§lRANK UP: ${s.rank}`);
+                // The ARISE action bar replaces this one 12 ticks later, so the
+                // headline also goes to chat where it is not stamped over.
+                tell(killer, `§d§lRANK UP: §f${s.rank}`);
+                safeSound(killer, "block.beacon.activate", { pitch: 1.4, volume: 0.8 });
+            }
         } else {
             // Kill feedback: XP blip on the action bar + orb sound.
             setActionBar(killer, `§b+${gain} XP §8(${s.xp}/${xpNext(s.level)})`);
@@ -849,7 +1064,11 @@ world.afterEvents.entityHurt.subscribe((ev) => {
         if (!hitter || hitter.typeId !== "minecraft:player") return;
         const target = ev.hurtEntity;
         if (!target || !target.isValid || target.id === hitter.id) return;
-        const bonus = num(hitter.getDynamicProperty("lu_str")) * STR_DMG_PER_POINT;
+        // Clamp through the same cap loadStats refunds against. Reading the raw
+        // property let a legacy/edited STR above 50 deal uncapped bonus damage
+        // while the excess was also being refunded as points.
+        const str = Math.min(num(hitter.getDynamicProperty("lu_str")), statCap("str"));
+        const bonus = str * STR_DMG_PER_POINT;
         if (bonus <= 0) return;
         const dealt = ev.damage;
         if (!Number.isFinite(dealt) || dealt <= 0) return;
@@ -884,7 +1103,9 @@ world.afterEvents.playerSpawn.subscribe((ev) => {
         try {
             // AGI too: without this the upkeep loop was the only thing granting speed,
             // so a respawn left the player walking at base speed for up to 5s.
-            if (ev.player.isValid) { applyAgility(ev.player); applyDurability(ev.player); }
+            // Skills too: night vision, fire resistance, etc. should come back
+            // immediately on respawn rather than waiting for the upkeep pass.
+            if (ev.player.isValid) { applyAgility(ev.player); applyDurability(ev.player); applySkills(ev.player); }
         } catch { /* ignore */ }
     }, 10);
 });
@@ -897,6 +1118,8 @@ system.runInterval(() => {
             applyAgility(player);
             // Keep the health_boost fallback alive (and grant it the first time round).
             if (maxHpWritable !== true) applyDurability(player);
+            // Maintain owned skill effects.
+            applySkills(player);
             const level = num(player.getDynamicProperty("lu_level"), 1);
             if (level >= AURA_MIN_LEVEL) {
                 try {

@@ -15,7 +15,7 @@ jobs:
           node-version: 20
       - name: Check JS syntax + manifest
         run: npm run check
-      - name: Run test suite (35 core + fresh-session regression)
+      - name: Run test suite (58 core + fresh-session regression)
         run: npm test
       - name: Run extended coverage suite
         run: node tests/coverage.test.mjs

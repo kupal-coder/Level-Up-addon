@@ -18,6 +18,13 @@ async function advanceAsync(n) { for (let i = 0; i < n; i++) { advance(1); await
 
 const P = harness.Player;
 function newPlayer(name) { const p = new P(name); harness.players.push(p); return p; }
+// Emit `n` player-kills on one mob so we can level quickly without re-spawning.
+function killN(killer, n) {
+    const victim = killer.dimension.spawnEntity("minecraft:zombie", killer.location);
+    for (let i = 0; i < n; i++) {
+        world.afterEvents.entityDie.emit({ damageSource: { damagingEntity: killer }, deadEntity: victim });
+    }
+}
 // formLog.shown is global, so a re-open chain left running by an earlier test
 // would otherwise be counted against whoever we are asserting on.
 const formsFor = (p) => formLog.shown.filter((s) => s.player === p.id).length;
@@ -439,7 +446,286 @@ await t("spending the last point does not pop an empty form", async () => {
     formLog.respond = null;
 });
 
-// --- 10. scriptevent fallback ---
+await t("skill points do not re-open the SYSTEM after the last stat point", async () => {
+    advance(120);
+    const sp = newPlayer("statclose");
+    sp.setDynamicProperty("lu_points", 1);
+    sp.setDynamicProperty("lu_skill_points", 1);
+    formLog.shown.length = 0;
+    formLog.respond = () => ({ canceled: false, selection: 0 }); // spend on STR
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sp });
+    await advanceAsync(60);
+    assert.strictEqual(sp.getDynamicProperty("lu_points"), 0, "stat point was not spent");
+    assert.strictEqual(formsFor(sp), 1,
+        "SYSTEM re-opened because skill points remain (" + formsFor(sp) + ")");
+    formLog.respond = null;
+});
+
+// --- 9f. the form body must contain real line breaks ---
+// The body was written with `\\n` — an escaped backslash — so every line break
+// stayed literal "\n" text and the SYSTEM window rendered as one long line
+// with visible backslash-n's between the fields.
+await t("SYSTEM form body renders real newlines", async () => {
+    advance(120);
+    formLog.shown.length = 0;
+    const nb = newPlayer("bodyline");
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: nb });
+    await advanceAsync(15);
+    const last = formLog.shown.filter((s) => s.player === nb.id).pop();
+    assert.ok(last, "form not shown");
+    assert.ok(!last.body.includes("\\n"), "body still contains literal \\n text");
+    assert.ok(last.body.split("\n").length >= 6, "body lost its line breaks");
+    formLog.respond = null;
+});
+
+// A stray § before the XP count made the renderer eat the first digit
+// (XP 37 displayed as "7/100").
+await t("SYSTEM form body does not eat the first XP digit", async () => {
+    advance(120);
+    formLog.shown.length = 0;
+    const xp = newPlayer("xpcolor");
+    xp.setDynamicProperty("lu_level", 2);
+    xp.setDynamicProperty("lu_xp", 37);
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: xp });
+    await advanceAsync(15);
+    const last = formLog.shown.filter((s) => s.player === xp.id).pop();
+    assert.ok(last, "form not shown");
+    assert.ok(!last.body.includes("(§"), "XP starts a color code right after '(' — first digit is eaten: " + last.body);
+    assert.ok(last.body.includes("37/100 XP"), "XP not rendered as 37/100: " + last.body);
+    formLog.respond = null;
+});
+
+// --- 10. skills ---
+await t("level up grants 1 skill point", async () => {
+    const k = newPlayer("sklvl");
+    killN(k, 12); // 60 XP → level 2
+    advance(40);
+    assert.strictEqual(k.getDynamicProperty("lu_level"), 2, "level should be 2");
+    assert.strictEqual(k.getDynamicProperty("lu_points"), 3, "3 stat points");
+    assert.strictEqual(k.getDynamicProperty("lu_skill_points"), 1, "1 skill point");
+});
+
+await t("existing saves are back-filled with level-1 skill points once", async () => {
+    advance(120);
+    const old = newPlayer("migrate");
+    old.setDynamicProperty("lu_level", 5);
+    old.setDynamicProperty("lu_skill_points", 0);
+    await advanceAsync(101); // upkeep touches loadStats -> migration
+    assert.strictEqual(old.getDynamicProperty("lu_skill_points"), 4,
+        "a level-5 save from before skills did not get 4 points");
+    assert.strictEqual(old.getDynamicProperty("lu_skill_migrated"), 1, "migration marker not set");
+    await advanceAsync(101);
+    assert.strictEqual(old.getDynamicProperty("lu_skill_points"), 4, "migration paid out twice");
+});
+
+await t("buying Night Vision grants the effect", async () => {
+    advance(120);
+    const sk = newPlayer("skbuy");
+    sk.setDynamicProperty("lu_skill_points", 1);
+    formLog.shown.length = 0;
+    // 1st form.show = main (tap SKILLS), 2nd = skills (buy Night Vision, index 0),
+    // 3rd = the skills re-open after a purchase → close it.
+    let shown = 0;
+    formLog.respond = () => {
+        shown++;
+        if (shown === 1) return { canceled: false, selection: 3 };
+        if (shown === 2) return { canceled: false, selection: 0 };
+        return { canceled: true, cancelationReason: "UserClosed" };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sk });
+    await advanceAsync(30);
+    assert.ok(sk.getEffect("night_vision"), "night vision not granted");
+    assert.strictEqual(sk.getDynamicProperty("lu_skill_points"), 0, "skill point not spent");
+    formLog.respond = null;
+});
+
+await t("upkeep maintains an owned skill effect", async () => {
+    advance(120);
+    const sk = newPlayer("skkeep");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    sk.setDynamicProperty("lu_skill_points", 0);
+    assert.ok(!sk.getEffect("night_vision"), "precondition: no effect yet");
+    await advanceAsync(101);
+    assert.ok(sk.getEffect("night_vision"), "owned skill effect not maintained by upkeep");
+});
+
+await t("Night Vision is granted above the 10s flicker threshold", async () => {
+    advance(120);
+    const sk = newPlayer("skflicker");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    await advanceAsync(101);
+    const eff = sk.getEffect("night_vision");
+    assert.ok(eff, "night vision not granted");
+    const left = eff.until - harness.tick;
+    assert.ok(left > 200, `only ${left} ticks left — vanilla Night Vision flickers at <= 200`);
+});
+
+await t("removing an owned skill refunds the point without stripping the effect", async () => {
+    advance(120);
+    const sk = newPlayer("skrem");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    sk.setDynamicProperty("lu_skill_points", 0);
+    await advanceAsync(101);
+    assert.ok(sk.getEffect("night_vision"), "precondition: effect granted");
+    formLog.shown.length = 0;
+    // 1st = main (SKILLS), 2nd = skills (remove Night Vision, index 0),
+    // 3rd = re-open (the refund can be spent) → close it.
+    let shown = 0;
+    formLog.respond = () => {
+        shown++;
+        if (shown === 1) return { canceled: false, selection: 3 };
+        if (shown === 2) return { canceled: false, selection: 0 };
+        return { canceled: true, cancelationReason: "UserClosed" };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sk });
+    await advanceAsync(30);
+    // Amplifier 0 cannot identify us, so removeEffect would also strip a real
+    // potion. The effect is left to expire instead of vanishing immediately.
+    assert.ok(sk.getEffect("night_vision"), "effect was stripped instantly (a same-amp potion would be removed too)");
+    assert.strictEqual(sk.getDynamicProperty("lu_skill_points"), 1, "point not refunded");
+    await advanceAsync(401);
+    assert.ok(!sk.getEffect("night_vision"), "unowned skill effect was refreshed instead of expiring");
+    formLog.respond = null;
+});
+
+await t("upkeep never removes a night_vision from another source", async () => {
+    advance(120);
+    const f = newPlayer("skforeign");
+    f.setDynamicProperty("lu_skill_nv", 0); // we do not own it
+    f.addEffect("night_vision", 20000, { amplifier: 0 });
+    assert.ok(f.getEffect("night_vision"), "precondition: foreign effect present");
+    await advanceAsync(101);
+    assert.ok(f.getEffect("night_vision"), "foreign night_vision was stripped");
+});
+
+// --- 11. ranks ---
+await t("rank is stored and clamped on level up", async () => {
+    const k = newPlayer("rank1");
+    k.setDynamicProperty("lu_level", 100);
+    k.setDynamicProperty("lu_points", 1);
+    formLog.shown.length = 0;
+    formLog.respond = () => ({ canceled: false, selection: 0 }); // spend a stat point to trigger saveStats
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: k });
+    await advanceAsync(20);
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "National Hunter", "rank not National Hunter at level 100");
+    formLog.respond = null;
+});
+
+await t("rank advances E → D → C as the player levels", async () => {
+    const k = newPlayer("rank2");
+    killN(k, 60); // 300 XP → level 4 (E)
+    advance(40);
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "E", "rank should be E at level 4");
+    killN(k, 40); // +200 XP → level 5 (D)
+    advance(40);
+    assert.strictEqual(k.getDynamicProperty("lu_level"), 5, "should be level 5");
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "D", "rank should be D at level 5");
+    killN(k, 350); // +1750 XP → level 10 (C)
+    advance(40);
+    assert.ok(k.getDynamicProperty("lu_level") >= 10, "should be level 10+");
+    assert.strictEqual(k.getDynamicProperty("lu_rank"), "C", "rank should be C at level 10");
+});
+
+await t("rank up announcement on action bar", async () => {
+    const k = newPlayer("rankup");
+    const victim = k.dimension.spawnEntity("minecraft:zombie", k.location);
+    for (let i = 0; i < 100; i++) { // 500 XP → level 5, E → D
+        world.afterEvents.entityDie.emit({ damageSource: { damagingEntity: k }, deadEntity: victim });
+    }
+    advance(40);
+    const ab = harness.actionBars.filter((a) => a.who === k.id && a.t.includes("RANK UP"));
+    assert.ok(ab.length >= 1, "rank up not announced");
+    assert.ok(ab[0].t.includes("D"), "wrong rank announced: " + ab[0].t);
+});
+
+// --- 12. v1.4.4 bug fixes ---
+// The skill effect lasts 200 ticks and upkeep runs every 100, so it must be
+// renewed on each pass — waiting for expiry leaves it at the mercy of a late pass.
+await t("owned skill effects are renewed on every upkeep pass", async () => {
+    advance(120);
+    const sk = newPlayer("skrefresh");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    sk.setDynamicProperty("lu_agi", 1); // speed is refreshed every pass -> pass detector
+    await advanceAsync(101);
+    const firstSkill = sk.getEffect("night_vision");
+    let lastSpeed = sk.getEffect("speed");
+    assert.ok(firstSkill && lastSpeed, "precondition: maintained effects not granted");
+    // Step to the next upkeep pass (< 200 ticks after the skill's grant, because
+    // a pass happened at most 100 ticks before we captured) using speed's `until`
+    // as the "a pass ran" signal.
+    let passSeen = false;
+    for (let i = 0; i < 100; i++) {
+        await advanceAsync(1);
+        const cur = sk.getEffect("speed");
+        assert.ok(cur, "precondition: speed lapsed while waiting for a pass");
+        if (cur.until > lastSpeed.until) { passSeen = true; break; }
+    }
+    assert.ok(passSeen, "precondition: no upkeep pass observed within 100 ticks");
+    const secondSkill = sk.getEffect("night_vision");
+    assert.ok(secondSkill, "skill effect lapsed on the next upkeep pass");
+    assert.ok(secondSkill.until > firstSkill.until,
+        `effect not renewed (until ${secondSkill.until} vs ${firstSkill.until}) — a late upkeep pass would let it blink out`);
+});
+
+await t("a stat tap with only skill points left opens the SKILLS menu", async () => {
+    advance(120);
+    const z = newPlayer("skstrand");
+    z.setDynamicProperty("lu_points", 0);
+    z.setDynamicProperty("lu_skill_points", 1);
+    formLog.shown.length = 0;
+    let shown = 0;
+    formLog.respond = () => {
+        shown += 1;
+        if (shown === 1) return { canceled: false, selection: 0 }; // tap STR with no stat points
+        return { canceled: true, cancelationReason: "UserClosed" };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
+    await advanceAsync(40);
+    assert.ok(formsFor(z) >= 2, "skill point stranded: the form closed on 'No stat points'");
+    formLog.respond = null;
+});
+
+await t("level up announcement mentions the skill point", async () => {
+    advance(120);
+    const k = newPlayer("skmsg");
+    harness.messages.length = 0;
+    killN(k, 12); // 60 XP -> level 2
+    advance(40);
+    const msgs = harness.messages.filter((m) => m.who === k.id).map((m) => m.t);
+    assert.ok(msgs.some((t) => /skill/i.test(t)), "level-up message never mentions skill points");
+});
+
+await t("rank up is also announced in chat, not just the action bar", async () => {
+    advance(120);
+    const k = newPlayer("rankmsg");
+    harness.messages.length = 0;
+    killN(k, 100); // 500 XP -> level 5, E -> D
+    advance(40);
+    const msgs = harness.messages.filter((m) => m.who === k.id).map((m) => m.t);
+    assert.ok(msgs.some((t) => t.includes("RANK UP")),
+        "rank up never reached chat (ARISE overwrites the action bar 12 ticks later)");
+});
+
+await t("a locked skill does not close the menu while a skill can still be removed", async () => {
+    advance(120);
+    const z = newPlayer("sklocked");
+    z.setDynamicProperty("lu_skill_points", 0);
+    z.setDynamicProperty("lu_skill_nv", 1);
+    formLog.shown.length = 0;
+    let shown = 0;
+    formLog.respond = () => {
+        shown += 1;
+        if (shown === 1) return { canceled: false, selection: 3 }; // SYSTEM -> SKILLS
+        if (shown === 2) return { canceled: false, selection: 1 }; // tap locked Fire Resistance
+        return { canceled: true, cancelationReason: "UserClosed" };
+    };
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: z });
+    await advanceAsync(50);
+    assert.ok(formsFor(z) >= 3, "skills menu closed even though an owned skill could be removed");
+    formLog.respond = null;
+});
+
+// --- 13. scriptevent fallback ---
 await t("/scriptevent lu:stats opens the SYSTEM", () => {
     advance(120);
     formLog.shown.length = 0;
@@ -495,6 +781,64 @@ await t("stale health_boost is dropped before effectiveMax is ever probed", () =
     // maxHpWritable flag is still undefined, which this shared suite never is.
     const r = spawnSync(process.execPath, [join(here, "stale-boost.test.mjs")], { encoding: "utf8" });
     assert.strictEqual(r.status, 0, (r.stdout || "") + (r.stderr || ""));
+});
+
+// --- 13. stored-vs-effective clamp regressions ---
+await t("over-cap STR does not deal uncapped bonus damage", () => {
+    harness.damages.length = 0;
+    const s = newPlayer("strCap");
+    s.setDynamicProperty("lu_str", 200); // corrupt/legacy, cap is 50
+    const mob = s.dimension.spawnEntity("minecraft:cow", s.location);
+    world.afterEvents.entityHurt.emit({
+        damageSource: { cause: "entityAttack", damagingEntity: s },
+        hurtEntity: mob, damage: 7,
+    });
+    advance(3);
+    assert.strictEqual(harness.damages.length, 1, "bonus damage not applied");
+    assert.strictEqual(harness.damages[0].amount, 7 + 25, "bonus was not capped at +25, got " + harness.damages[0].amount);
+});
+
+await t("recorded over-cap DUR boost is downgraded to the clamped cap", async () => {
+    advance(120);
+    const d = newPlayer("durBoost");
+    d.setDynamicProperty("lu_dur", 40);      // 15 over DUR_CAP 25
+    d.setDynamicProperty("lu_boost_amp", 39); // the boost this save once earned
+    d.addEffect("health_boost", 20000, { amplifier: 39 });
+    await advanceAsync(101); // one upkeep pass clamps DUR and must follow the boost down
+    const eff = d.getEffect("health_boost");
+    assert.ok(eff, "boost disappeared");
+    assert.strictEqual(eff.amplifier, 24, "boost stayed at amp " + eff.amplifier);
+    assert.strictEqual(d.getComponent("health").effectiveMax, 120, "max HP stayed inflated at " + d.getComponent("health").effectiveMax);
+});
+
+await t("recorded over-cap AGI speed is downgraded to the clamped cap", async () => {
+    advance(120);
+    const a = newPlayer("agiBoost");
+    a.setDynamicProperty("lu_agi", 20);       // 15 over AGI_CAP 5
+    a.setDynamicProperty("lu_speed_amp", 19); // Speed XX from the old save
+    a.addEffect("speed", 20000, { amplifier: 19 });
+    await advanceAsync(101);
+    const eff = a.getEffect("speed");
+    assert.ok(eff, "speed disappeared");
+    assert.strictEqual(eff.amplifier, 4, "stayed at Speed " + (eff.amplifier + 1));
+});
+
+await t("a corrupt non-1 skill flag still counts as owned", async () => {
+    advance(120);
+    const c = newPlayer("skillCorrupt");
+    c.setDynamicProperty("lu_skill_nv", 2);
+    await advanceAsync(101);
+    const eff = c.getEffect("night_vision");
+    assert.ok(eff, "flag 2 was treated as unowned: skill never applied and cannot be removed");
+    assert.strictEqual(eff.amplifier, 0);
+});
+
+await t("killing a non-mob (armor stand) does not award XP", () => {
+    const k = newPlayer("standFarm");
+    const stand = k.dimension.spawnEntity("minecraft:armor_stand", k.location);
+    world.afterEvents.entityDie.emit({ damageSource: { damagingEntity: k }, deadEntity: stand });
+    advance(5);
+    assert.strictEqual(k.getDynamicProperty("lu_xp"), undefined, "armor stand kill awarded XP");
 });
 
 let fails = 0;
