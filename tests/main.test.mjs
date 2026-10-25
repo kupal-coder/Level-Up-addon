@@ -446,6 +446,21 @@ await t("spending the last point does not pop an empty form", async () => {
     formLog.respond = null;
 });
 
+await t("skill points do not re-open the SYSTEM after the last stat point", async () => {
+    advance(120);
+    const sp = newPlayer("statclose");
+    sp.setDynamicProperty("lu_points", 1);
+    sp.setDynamicProperty("lu_skill_points", 1);
+    formLog.shown.length = 0;
+    formLog.respond = () => ({ canceled: false, selection: 0 }); // spend on STR
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sp });
+    await advanceAsync(60);
+    assert.strictEqual(sp.getDynamicProperty("lu_points"), 0, "stat point was not spent");
+    assert.strictEqual(formsFor(sp), 1,
+        "SYSTEM re-opened because skill points remain (" + formsFor(sp) + ")");
+    formLog.respond = null;
+});
+
 // --- 9f. the form body must contain real line breaks ---
 // The body was written with `\\n` — an escaped backslash — so every line break
 // stayed literal "\n" text and the SYSTEM window rendered as one long line
@@ -463,6 +478,23 @@ await t("SYSTEM form body renders real newlines", async () => {
     formLog.respond = null;
 });
 
+// A stray § before the XP count made the renderer eat the first digit
+// (XP 37 displayed as "7/100").
+await t("SYSTEM form body does not eat the first XP digit", async () => {
+    advance(120);
+    formLog.shown.length = 0;
+    const xp = newPlayer("xpcolor");
+    xp.setDynamicProperty("lu_level", 2);
+    xp.setDynamicProperty("lu_xp", 37);
+    system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: xp });
+    await advanceAsync(15);
+    const last = formLog.shown.filter((s) => s.player === xp.id).pop();
+    assert.ok(last, "form not shown");
+    assert.ok(!last.body.includes("(§"), "XP starts a color code right after '(' — first digit is eaten: " + last.body);
+    assert.ok(last.body.includes("37/100 XP"), "XP not rendered as 37/100: " + last.body);
+    formLog.respond = null;
+});
+
 // --- 10. skills ---
 await t("level up grants 1 skill point", async () => {
     const k = newPlayer("sklvl");
@@ -473,18 +505,32 @@ await t("level up grants 1 skill point", async () => {
     assert.strictEqual(k.getDynamicProperty("lu_skill_points"), 1, "1 skill point");
 });
 
+await t("existing saves are back-filled with level-1 skill points once", async () => {
+    advance(120);
+    const old = newPlayer("migrate");
+    old.setDynamicProperty("lu_level", 5);
+    old.setDynamicProperty("lu_skill_points", 0);
+    await advanceAsync(101); // upkeep touches loadStats -> migration
+    assert.strictEqual(old.getDynamicProperty("lu_skill_points"), 4,
+        "a level-5 save from before skills did not get 4 points");
+    assert.strictEqual(old.getDynamicProperty("lu_skill_migrated"), 1, "migration marker not set");
+    await advanceAsync(101);
+    assert.strictEqual(old.getDynamicProperty("lu_skill_points"), 4, "migration paid out twice");
+});
+
 await t("buying Night Vision grants the effect", async () => {
     advance(120);
     const sk = newPlayer("skbuy");
     sk.setDynamicProperty("lu_skill_points", 1);
     formLog.shown.length = 0;
-    // 1st form.show = main (tap SKILLS), 2nd = skills (buy Night Vision, index 0)
+    // 1st form.show = main (tap SKILLS), 2nd = skills (buy Night Vision, index 0),
+    // 3rd = the skills re-open after a purchase → close it.
     let shown = 0;
     formLog.respond = () => {
         shown++;
-        return shown === 1
-            ? { canceled: false, selection: 3 }
-            : { canceled: false, selection: 0 };
+        if (shown === 1) return { canceled: false, selection: 3 };
+        if (shown === 2) return { canceled: false, selection: 0 };
+        return { canceled: true, cancelationReason: "UserClosed" };
     };
     system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sk });
     await advanceAsync(30);
@@ -503,7 +549,18 @@ await t("upkeep maintains an owned skill effect", async () => {
     assert.ok(sk.getEffect("night_vision"), "owned skill effect not maintained by upkeep");
 });
 
-await t("removing an owned skill refunds the point and drops only our effect", async () => {
+await t("Night Vision is granted above the 10s flicker threshold", async () => {
+    advance(120);
+    const sk = newPlayer("skflicker");
+    sk.setDynamicProperty("lu_skill_nv", 1);
+    await advanceAsync(101);
+    const eff = sk.getEffect("night_vision");
+    assert.ok(eff, "night vision not granted");
+    const left = eff.until - harness.tick;
+    assert.ok(left > 200, `only ${left} ticks left — vanilla Night Vision flickers at <= 200`);
+});
+
+await t("removing an owned skill refunds the point without stripping the effect", async () => {
     advance(120);
     const sk = newPlayer("skrem");
     sk.setDynamicProperty("lu_skill_nv", 1);
@@ -512,7 +569,7 @@ await t("removing an owned skill refunds the point and drops only our effect", a
     assert.ok(sk.getEffect("night_vision"), "precondition: effect granted");
     formLog.shown.length = 0;
     // 1st = main (SKILLS), 2nd = skills (remove Night Vision, index 0),
-    // 3rd = re-open (anySpendable is true after refund) → close it.
+    // 3rd = re-open (the refund can be spent) → close it.
     let shown = 0;
     formLog.respond = () => {
         shown++;
@@ -522,8 +579,12 @@ await t("removing an owned skill refunds the point and drops only our effect", a
     };
     system.afterEvents.scriptEventReceive.emit({ id: "lu:stats", sourceEntity: sk });
     await advanceAsync(30);
-    assert.ok(!sk.getEffect("night_vision"), "owned skill not removed");
+    // Amplifier 0 cannot identify us, so removeEffect would also strip a real
+    // potion. The effect is left to expire instead of vanishing immediately.
+    assert.ok(sk.getEffect("night_vision"), "effect was stripped instantly (a same-amp potion would be removed too)");
     assert.strictEqual(sk.getDynamicProperty("lu_skill_points"), 1, "point not refunded");
+    await advanceAsync(401);
+    assert.ok(!sk.getEffect("night_vision"), "unowned skill effect was refreshed instead of expiring");
     formLog.respond = null;
 });
 

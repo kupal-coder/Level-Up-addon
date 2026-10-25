@@ -2,6 +2,18 @@
 
 Follows semver for behavior-pack version (`LevelUp_BP/manifest.json` header `name` + `version` + `LevelUp_vX.Y.Z.mcpack` filename — see `AGENTS.md` release convention).
 
+## v1.4.5
+
+**Bug fixes**
+- SYSTEM header rendered `(§37/100 XP)`: the stray `§` swallowed the first XP digit, so XP 37 displayed as `7/100`. Now `(Level 2 • 37/100 XP)`.
+- Stat and skill points no longer share a re-open gate. Spending the last stat point with skill points left no longer re-pops the SYSTEM form, and skill points never keep the SKILLS menu alive. New `statsSpendable()` / `skillsChangeable()` / `canBuySkill()` split the two menus.
+- Night Vision flickered because every grant lasted only 200 ticks (vanilla flashes when under ~10 s). Skill effects now last 400 ticks, still refreshed by the 100-tick upkeep.
+- Removing a skill no longer calls `removeEffect`: every skill is amplifier 0, so we cannot tell our effect from a potion. Removal could therefore strip a real potion. The effect is now left to expire (≤ 20 s) instead. (Same-strength potion durations are still replaced while the skill is owned — that is unavoidable without a source tag, and is documented.)
+- Existing saves receive a one-time back-fill of `level - 1` skill points (`lu_skill_migrated`), so players who leveled before v1.4.3 are not stuck at 0.
+
+**Tests**
+- 4 new tests + 1 rewritten removal test (53 core total). Each new assertion was verified to fail against the v1.4.4 script.
+
 ## v1.4.4
 
 **Bug fixes**

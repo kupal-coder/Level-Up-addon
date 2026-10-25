@@ -28,8 +28,15 @@ const MAX_LEVEL = 100; // hard cap — prevents unbounded while loop / point inf
 const SKILL_POINTS_PER_LEVEL = 1; // one skill point per level-up, separate from stat points
 
 // Skills are binary (owned / not owned), cost 1 skill point each, and are granted
-// as maintained effects — exactly like Durability's health_boost and Agility's
-// speed, with the same "never touch what we didn't grant" ownership discipline.
+// as maintained effects like Durability's health_boost and Agility's speed — but
+// every skill is amplifier 0, so an amplifier record cannot prove who granted it.
+// Two consequences, both deliberate:
+//  - while owned, the effect is topped up every pass, which replaces the remaining
+//    duration of a same-strength potion (a stronger effect is still left alone);
+//  - removing a skill never calls removeEffect — that could strip a real potion
+//    we cannot tell apart. The effect is simply left to expire (<= 400 ticks).
+const SKILL_EFFECT_TICKS = 400; // > the ~10s Night Vision flicker threshold
+const SKILL_MIGRATION_PROP = "lu_skill_migrated"; // set once level-1 points are back-filled
 const SKILLS = [
     { key: "nv", name: "Night Vision", effect: "night_vision", amp: 0, desc: "See in the dark" },
     { key: "fr", name: "Fire Resistance", effect: "fire_resistance", amp: 0, desc: "Immune to fire and lava" },
@@ -89,6 +96,19 @@ function loadStats(player) {
     if (s.str > MAX_STAT) { s.points += s.str - MAX_STAT; s.str = MAX_STAT; }
     if (s.dur > DUR_CAP) { s.points += s.dur - DUR_CAP; s.dur = DUR_CAP; }
     if (s.agi > AGI_CAP) { s.points += s.agi - AGI_CAP; s.agi = AGI_CAP; }
+    // One-time back-fill for saves created before skill points existed: every
+    // level above 1 should have granted one, so pay out level-1 once. Written
+    // here (not in saveStats) so a player who never opens a form still gets it
+    // on the next upkeep pass. The marker makes it idempotent — including for
+    // players who already earned points after v1.4.3 (they get a small bonus
+    // rather than the migration silently skipping older worlds).
+    if (player.getDynamicProperty(SKILL_MIGRATION_PROP) !== 1) {
+        try {
+            s.skillPoints += Math.max(0, s.level - 1);
+            player.setDynamicProperty("lu_skill_points", s.skillPoints);
+            player.setDynamicProperty(SKILL_MIGRATION_PROP, 1);
+        } catch { /* player left mid-read */ }
+    }
     return s;
 }
 
@@ -115,11 +135,24 @@ function saveStats(player, s) {
     } catch { /* player left mid-write */ }
 }
 
-// Can the player still do anything in the SKILLS menu? Buying needs a point and
-// an unowned skill; removing an owned skill always works (it refunds the point).
+// Can the player buy another skill? This is the only SKILLS action that spends a
+// point; removal is a separate (always available) action.
+function canBuySkill(s) {
+    return s.skillPoints > 0 && SKILLS.some((sk) => !s[`skill_${sk.key}`]);
+}
+
+// Is there still a reason to keep the SKILLS menu open? Buying or removing.
+// Deliberately blind to stat points — those belong to the SYSTEM menu.
 function skillsChangeable(s) {
-    return SKILLS.some((sk) => s[`skill_${sk.key}`] === 1) ||
-        (s.skillPoints > 0 && SKILLS.some((sk) => !s[`skill_${sk.key}`]));
+    return canBuySkill(s) || SKILLS.some((sk) => s[`skill_${sk.key}`] === 1);
+}
+
+// Is there anywhere left to put a *stat* point? Skill points live in a different
+// menu, so they must never keep the SYSTEM form open (or re-open it) after the
+// last stat point is spent.
+function statsSpendable(s) {
+    return s.points > 0 &&
+        (s.str < statCap("str") || s.dur < statCap("dur") || s.agi < statCap("agi"));
 }
 
 // Highest value of `key` that still changes something. Agility saturates early;
@@ -131,15 +164,10 @@ function statCap(key) {
     return MAX_STAT;
 }
 
-// Is there anywhere left to put a point? A re-open is only worth it if the player
-// has an unspent point AND a stat that will take it. When everything is capped
-// there is nothing to strand, and re-opening anyway traps them: every tap just
-// re-opened the form, so Close was the only way out.
-function anySpendable(s) {
-    return (s.points > 0 &&
-        (s.str < statCap("str") || s.dur < statCap("dur") || s.agi < statCap("agi"))) ||
-        (s.skillPoints > 0 && SKILLS.some((sk) => !s[`skill_${sk.key}`]));
-}
+// A stat re-open is only worth it if the player has an unspent point AND a stat
+// that will take it. When everything is capped there is nothing to strand, and
+// re-opening anyway trapped them: every tap just re-opened the form, so Close was
+// the only way out. (Skill points are handled by canBuySkill/skillsChangeable.)
 
 // ---- DUR -> max HP ----
 // On @minecraft/server 2.0.0 every EntityAttributeComponent member is read-only:
@@ -292,34 +320,20 @@ function applyAgility(player) {
     } catch { /* effect unavailable */ }
 }
 
-// Grant or revoke each owned skill as a maintained effect. Ownership uses the
-// same `lu_skill_<key>_amp` record as Durability/Agility, so a beacon or potion
-// effect we never granted is never stripped, and our own effect is cleaned up
-// when the skill is removed.
+// Grant or top up each owned skill as a maintained effect. Amplifier 0 is
+// indistinguishable from a potion's, so removal deliberately does nothing: the
+// unused effect expires on its own instead of risking a real potion being
+// stripped. A strictly stronger foreign effect (beacon Haste II, /effect) is
+// never downgraded; equality is refreshed so ours cannot lapse between passes.
 function applySkills(player) {
     try {
         const s = loadStats(player);
         for (const sk of SKILLS) {
-            const owned = s[`skill_${sk.key}`] === 1;
-            const ampProp = `lu_skill_${sk.key}_amp`;
+            if (s[`skill_${sk.key}`] !== 1) continue; // not owned -> let it expire
             try {
                 const cur = player.getEffect(sk.effect);
-                if (owned) {
-                    // Leave a strictly stronger foreign effect (beacon Haste II,
-                    // /effect) alone, but equality — ours OR a same-strength one —
-                    // must still be refreshed every pass. Skipping the renewal let
-                    // the 200-tick effect run out before the 100-tick upkeep pass
-                    // re-granted it, exactly the blink-out applyAgility avoids.
-                    if (cur !== undefined && cur.amplifier > sk.amp) continue;
-                    player.addEffect(sk.effect, 200, { amplifier: sk.amp, showParticles: false });
-                    player.setDynamicProperty(ampProp, sk.amp);
-                } else {
-                    const mine = num(player.getDynamicProperty(ampProp), -1);
-                    if (cur !== undefined && mine >= 0 && cur.amplifier === mine) {
-                        player.removeEffect(sk.effect);
-                        player.setDynamicProperty(ampProp, undefined);
-                    }
-                }
+                if (cur !== undefined && cur.amplifier > sk.amp) continue;
+                player.addEffect(sk.effect, SKILL_EFFECT_TICKS, { amplifier: sk.amp, showParticles: false });
             } catch { /* effect unavailable */ }
         }
     } catch { /* ignore */ }
@@ -629,7 +643,7 @@ function openSystem(player, retry = 1) {
     const form = new ActionFormData()
         .title("§l§bS Y S T E M")
         .body(
-            `§7Rank: §f${s.rank} §8(Level ${s.level}) (§${s.xp}/${need} XP)\n` +
+            `§7Rank: §f${s.rank} §8(Level ${s.level} • ${s.xp}/${need} XP)\n` +
             `§7Stat points: §e${s.points}  §7Skill points: §e${s.skillPoints}\n\n` +
             `§c⚔ Strength: §f${s.str} §8(+${(s.str * STR_DMG_PER_POINT).toFixed(1)} dmg${s.str >= statCap("str") ? " (max)" : ""})\n` +
             `§a❤ Durability: §f${s.dur} §8(${maxHpOf(player, s)} max HP${s.dur >= statCap("dur") ? " (max)" : ""})\n` +
@@ -657,14 +671,14 @@ function openSystem(player, retry = 1) {
         }
         const st = loadStats(player);
         if (st.points <= 0) {
-            const canBuySkill = st.skillPoints > 0 && SKILLS.some((sk) => !st[`skill_${sk.key}`]);
-            tell(player, canBuySkill
+            const hasSkillPoint = canBuySkill(st);
+            tell(player, hasSkillPoint
                 ? "§b[SYSTEM] §7No stat points — but you still have skill points to spend."
                 : "§b[SYSTEM] §7No stat points. Level up by defeating mobs.");
             safeSound(player, "block.beacon.deactivate", { pitch: 0.7, volume: 0.5 });
             // Skill points live in a different menu. Closing here stranded them
             // until the player redid the whole gesture.
-            if (canBuySkill) system.runTimeout(() => openSystemSkills(player, 1), 10);
+            if (hasSkillPoint) system.runTimeout(() => openSystemSkills(player, 1), 10);
             return;
         }
         const key = res.selection === 0 ? "str" : res.selection === 1 ? "dur" : "agi";
@@ -675,7 +689,9 @@ function openSystem(player, retry = 1) {
             // Re-open only if the points are still theirs to spend somewhere else.
             // Returning here without a form would strand them, but re-opening when
             // nothing is spendable just traps them in a form they cannot tap out of.
-            if (anySpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
+            // If only skill points are left, hand them to the SKILLS menu instead.
+            if (statsSpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
+            else if (canBuySkill(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
             return;
         }
         st[key] += 1;
@@ -689,17 +705,17 @@ function openSystem(player, retry = 1) {
         setActionBar(player, `§e${names[key]} §7→ §f${st[key]}`);
         tell(player, `§b[SYSTEM] §f${names[key]} §7→ §f${st[key]} §8(${st.points} points left)`);
         try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
-        // Re-open so points can be spent in a row (only while something is still
-        // spendable — otherwise the last spend pops an empty form). 10 ticks:
+        // Re-open so points can be spent in a row (only while a *stat* point is
+        // still spendable — otherwise the last spend pops an empty form). 10 ticks:
         // reopening too fast lands while the old form is still closing (UserBusy).
-        if (anySpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
+        if (statsSpendable(st)) system.runTimeout(() => openSystem(player, 1), 10);
     }).catch(() => { /* player offline / in another UI */ });
 }
 
 // ---- SKILLS window ----
 // Buy a skill for 1 skill point, or remove an owned skill to refund the point.
-// Effects are granted/revoked by applySkills() using the same ownership rules as
-// Durability/Agility, so foreign effects are never touched.
+// applySkills() maintains the effects; see its comment for the (deliberately
+// conservative) ownership rule at amplifier 0.
 function openSystemSkills(player, retry = 1) {
     let s;
     try {
@@ -750,9 +766,9 @@ function openSystemSkills(player, retry = 1) {
         tell(player, `§b[SYSTEM] §7${sk.name} §f${owned ? "removed" : "learned"}.`);
         safeSound(player, "random.orb", { pitch: owned ? 0.6 : 1.2, volume: 0.8 });
         try { showHologram(player, statusHoloLines(loadStats(player))); } catch { /* cosmetic */ }
-        // Re-open only while there is something left to do, so the last action
-        // does not pop an empty-looking menu the player has to Close.
-        if (anySpendable(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
+        // Re-open only while a skills action is left — stat points live in the
+        // SYSTEM menu and must not keep this one alive.
+        if (skillsChangeable(st)) system.runTimeout(() => openSystemSkills(player, 1), 10);
     }).catch(() => { /* player offline / in another UI */ });
 }
 
